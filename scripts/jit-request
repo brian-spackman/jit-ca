@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""jit-request — agent-side CLI to request just-in-time SSH access via the JIT-CA.
+
+Runs on the agent host. Publishes a request to the ntfy `jit-requests` topic
+and blocks until the CA publishes the signed cert back on `jit-certs` (or
+until timeout). The agent holds only publish creds to jit-requests + read on
+jit-certs; it cannot approve or sign.
+
+  usage: jit-request <target> <duration> <reason>
+  e.g.:  jit-request target-host-1 1h "restart the log-rotation service"
+
+On success the cert is written next to the agent key and its validity printed.
+See REPLICATION-GUIDE.md (Section 6) for wiring this into ~/.ssh/config.
+"""
+
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
+
+# PLACEHOLDER: ntfy URL reachable from the agent host (NTFY_FQDN in the guide).
+# LAN-only: use http://CA_HOST:8080 (plain HTTP, no proxy needed).
+# Off-LAN: use https://ntfy.example.net if you set up the TLS reverse proxy (Section 4.4).
+NTFY = "https://ntfy.example.net"
+TOPIC_REQ = "jit-requests"
+TOPIC_CERT = "jit-certs"
+TOKEN_FILE = Path.home() / ".config/jit-ca/ntfy-agent-token"
+KEY = Path.home() / ".ssh/jit-ca/agent_key"
+CERT = Path.home() / ".ssh/jit-ca/agent_key-cert.pub"
+TIMEOUT = 300  # seconds to wait for approval
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def ensure_key():
+    KEY.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(KEY.parent, 0o700)
+    if not KEY.exists():
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                        "-C", "jit-ca-agent", "-f", str(KEY)], check=True)
+    return (KEY.with_suffix(".pub")).read_text().strip()
+
+
+def main():
+    if len(sys.argv) != 4:
+        die("usage: jit-request <target> <duration> <reason>")
+    target, duration, reason = sys.argv[1], sys.argv[2], sys.argv[3]
+    if not TOKEN_FILE.exists():
+        die(f"missing agent ntfy token at {TOKEN_FILE}")
+    token = TOKEN_FILE.read_text().strip()
+    pubkey = ensure_key()
+    req_id = secrets.token_hex(8)
+
+    # ntfy JSON publish: topic + message; message is the request JSON string
+    request_json = json.dumps({"req_id": req_id, "target": target,
+                               "duration": duration, "reason": reason,
+                               "pubkey": pubkey})
+    payload = json.dumps({"topic": TOPIC_REQ, "message": request_json}).encode()
+    req = urlrequest.Request(
+        f"{NTFY}/", data=payload,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"}, method="POST")
+    try:
+        urlrequest.urlopen(req, timeout=15).read()
+    except (HTTPError, URLError) as e:
+        die(f"failed to publish request: {e}")
+    print(f"requested {target} for {duration} — waiting for approval "
+          f"(tap Approve on your phone, {TIMEOUT//60} min timeout)...")
+
+    # Poll the cert topic in a short loop. ntfy caches messages (12h), so a
+    # poll with a lookback window reliably catches the cert whenever it lands;
+    # we filter by req_id so a stale cert from a prior request is ignored.
+    # (A long-lived /json stream over urllib buffers unreliably — poll is robust.)
+    deadline = time.time() + TIMEOUT
+    poll_url = f"{NTFY}/{TOPIC_CERT}/json?poll=1&since=2m"
+    while time.time() < deadline:
+        try:
+            preq = urlrequest.Request(
+                poll_url, headers={"Authorization": f"Bearer {token}"})
+            data = urlrequest.urlopen(preq, timeout=15).read().decode()
+        except (HTTPError, URLError, OSError):
+            time.sleep(2)
+            continue
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("event") != "message":
+                continue
+            try:
+                body = json.loads(ev.get("message", ""))
+            except json.JSONDecodeError:
+                continue
+            if body.get("req_id") != req_id:
+                continue
+            if not body.get("cert"):
+                die("request closed — no cert issued", 2)
+            CERT.write_text(body["cert"].strip() + "\n")
+            os.chmod(CERT, 0o644)
+            out = subprocess.run(["ssh-keygen", "-L", "-f", str(CERT)],
+                                 capture_output=True, text=True).stdout
+            valid = next((l.strip() for l in out.splitlines()
+                          if "Valid:" in l), "")
+            print(f"approved — cert written to {CERT}")
+            print(valid)
+            return
+        time.sleep(2)
+    die("approval timed out — no cert received", 2)
+
+
+if __name__ == "__main__":
+    main()

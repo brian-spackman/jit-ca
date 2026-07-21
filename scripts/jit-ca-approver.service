@@ -1,0 +1,26 @@
+[Unit]
+Description=jit-ca approver — tap-to-sign SSH JIT approval daemon
+After=network-online.target ntfy.service step-ca.service
+Wants=network-online.target
+Requires=ntfy.service step-ca.service
+
+[Service]
+Type=simple
+User=step
+Group=step
+ExecStart=/usr/bin/python3 /usr/local/bin/jit-ca-approver
+Restart=on-failure
+RestartSec=5
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/jit-ca
+ReadOnlyPaths=/etc/jit-ca
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

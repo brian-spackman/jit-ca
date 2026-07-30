@@ -2,6 +2,8 @@
 
 > Give an AI agent the ability to work on your other machines **without** giving it standing keys to them. Default-deny everywhere; a single tap on your phone grants short-lived, scoped, auto-expiring access for one task. It's the just-in-time privileged-access pattern enterprise IAM tools (Azure PIM, AWS JIT access, CyberArk, etc.) use for humans, rebuilt for a self-hosted home lab out of `step-ca`, `ntfy`, and `ssh` certificates — a signing CA, not a directory-integrated identity platform.
 
+![Demo: an agent requests access to a cert-only box, the approval prompt is tapped on a phone, and the agent runs a command over the freshly-issued short-lived cert](./demo.gif)
+
 ## What's in this repo
 
 Three documents — this README, the [replication guide](./REPLICATION-GUIDE.md), and a [leaner standalone spec](./JIT-CA-SPEC.md) — covering the concept, the experience, and step-by-step build instructions in enough detail to implement your own instance from scratch. The [`scripts/`](./scripts/) directory contains sanitized reference implementations of the four core files: the approval daemon (`jit-ca-approver.py`), its systemd unit (`jit-ca-approver.service`), the agent-side request CLI (`jit-request`), and the CA host firewall script (`ufw-rules.sh`). Every deployment-specific value (IPs, hostnames, principal name, ntfy URL) is replaced with a clearly-marked placeholder comment; see the PLACEHOLDER lines near the top of each file.

@@ -16,6 +16,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+LogsDirectory=jit-ca
 ReadWritePaths=/var/log/jit-ca
 ReadOnlyPaths=/etc/jit-ca
 ProtectKernelTunables=true

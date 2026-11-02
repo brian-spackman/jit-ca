@@ -53,12 +53,16 @@ CA_URL = "https://localhost:9000"
 PRINCIPAL = "agent"                         # PLACEHOLDER: SSH principal/username on all target hosts
 AUDIT_LOG = "/var/log/jit-ca/audit.log"
 
-TOKEN_TTL = 600                             # pending approval lifetime (s)
+TOKEN_TTL = 300                             # pending approval lifetime (s); matches jit-request TIMEOUT
 MAX_DURATION_MIN = 8 * 60                   # hard cap on requested cert TTL
+MAX_PUBKEY_BYTES = 2048                     # upper bound on single-line SSH pubkey length
+MAX_REASON_CHARS = 200                      # upper bound on sanitized reason string
 # PLACEHOLDER: list your target hostnames here; requests for anything not in
 # this set are rejected before a notification is even sent.
 TARGET_ALLOWLIST = {"target-host-1", "target-host-2"}
 DURATION_RE = re.compile(r"^(\d+)([mh])$")
+REQ_ID_RE = re.compile(r"^[0-9a-f]{16,64}$")
+CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]+")
 
 with open(TOKEN_FILE) as fh:
     NTFY_TOKEN = fh.read().strip()
@@ -73,11 +77,23 @@ def log(msg):
     print(f"[approver] {msg}", flush=True)
 
 
+def target_principal(target):
+    return f"{PRINCIPAL}@{target}" if target else PRINCIPAL
+
+
+def sanitize_reason(raw):
+    if not isinstance(raw, str):
+        return ""
+    cleaned = CTRL_CHAR_RE.sub(" ", raw).strip()
+    return cleaned[:MAX_REASON_CHARS]
+
+
 def audit(action, rec, extra=""):
+    principal = target_principal(rec.get("target"))
     line = (
         f"{datetime.now(timezone.utc).isoformat()} {action} "
         f"target={rec.get('target')} duration={rec.get('duration')} "
-        f"principal={PRINCIPAL} req_id={rec.get('req_id')} "
+        f"principal={principal} req_id={rec.get('req_id')} "
         f"reason={json.dumps(rec.get('reason',''))} {extra}\n"
     )
     try:
@@ -112,7 +128,9 @@ def ntfy_publish(topic, message, title=None, actions=None, tags=None, priority=N
 
 
 def validate_duration(d):
-    m = DURATION_RE.match(d or "")
+    if not isinstance(d, str):
+        return None
+    m = DURATION_RE.match(d)
     if not m:
         return None
     n, unit = int(m.group(1)), m.group(2)
@@ -122,8 +140,9 @@ def validate_duration(d):
     return d
 
 
-def sign_cert(pubkey_text, duration):
-    """Sign pubkey_text for `duration`; return (cert_text, valid_str)."""
+def sign_cert(pubkey_text, duration, target=None):
+    """Sign pubkey_text for `duration` scoped to `target`; return (cert_text, valid_str)."""
+    principal = target_principal(target)
     tmpdir = tempfile.mkdtemp(prefix="jit-sign-", dir="/tmp")
     keyfile = os.path.join(tmpdir, "k.pub")
     certfile = os.path.join(tmpdir, "k-cert.pub")
@@ -135,8 +154,8 @@ def sign_cert(pubkey_text, duration):
             "--provisioner", PROVISIONER,
             "--provisioner-password-file", PROVISIONER_PW,
             "--ca-url", CA_URL, "--root", ROOT_CA,
-            "--principal", PRINCIPAL, "--not-after", duration,
-            PRINCIPAL, keyfile, "--force",
+            "--principal", principal, "--not-after", duration,
+            principal, keyfile, "--force",
         ]
         env = dict(os.environ, STEPPATH=STEPPATH)
         subprocess.run(cmd, env=env, check=True,
@@ -185,8 +204,13 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        token = self.rfile.read(length).decode().strip() if length else ""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return self._reply(400, "bad content-length")
+        if length < 0 or length > 256:
+            return self._reply(400, "invalid content-length")
+        token = self.rfile.read(length).decode("utf-8", errors="replace").strip() if length else ""
         reap_expired()
         with _lock:
             entry = _pending.pop(token, None) if token else None
@@ -196,12 +220,8 @@ class Handler(BaseHTTPRequestHandler):
                 audit("DENY", entry["record"])
                 log(f"denied req_id={entry['record']['req_id']} "
                     f"target={entry['record'].get('target')}")
-                # Generic close-out on jit-certs (the only topic the requester
-                # can read) so it can stop polling early without learning this
-                # was a deny rather than any other terminal non-issuance state.
-                ntfy_publish(TOPIC_CERT,
-                             json.dumps({"req_id": entry["record"]["req_id"],
-                                         "cert": None}))
+                # Publish nothing to TOPIC_CERT so an active human Deny is
+                # indistinguishable from silence/timeout to the requesting agent.
                 ntfy_publish(TOPIC_APPROVE,
                              f"Denied: {entry['record'].get('target')} — "
                              f"{entry['record'].get('reason')}",
@@ -220,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
 
         rec = entry["record"]
         try:
-            cert_text, valid = sign_cert(rec["pubkey"], rec["duration"])
+            cert_text, valid = sign_cert(rec["pubkey"], rec["duration"], rec.get("target"))
         except subprocess.CalledProcessError as e:
             log(f"sign failed: {e.stderr}")
             audit("SIGN_FAIL", rec, extra=f"err={json.dumps((e.stderr or '')[:200])}")
@@ -240,19 +260,29 @@ class Handler(BaseHTTPRequestHandler):
 
 # ---- request subscriber -----------------------------------------------------
 def handle_request(payload):
+    if not isinstance(payload, str):
+        log("dropping non-string request payload")
+        return
     try:
         rec = json.loads(payload)
     except json.JSONDecodeError:
         log("dropping non-JSON request")
         return
-    req_id = rec.get("req_id") or secrets.token_hex(8)
-    rec["req_id"] = req_id
+    if not isinstance(rec, dict):
+        log("dropping non-object JSON request")
+        return
+
+    req_id = rec.get("req_id")
+    if not isinstance(req_id, str) or not REQ_ID_RE.match(req_id):
+        log(f"rejecting request with missing/malformed req_id {req_id!r}")
+        return
+
     target = rec.get("target")
-    reason = rec.get("reason", "")
+    raw_reason = rec.get("reason", "")
     pubkey = rec.get("pubkey", "")
     duration = validate_duration(rec.get("duration"))
 
-    if target not in TARGET_ALLOWLIST:
+    if not isinstance(target, str) or target not in TARGET_ALLOWLIST:
         log(f"rejecting request for non-allowlisted target {target!r}")
         ntfy_publish(TOPIC_APPROVE,
                      f"Rejected request: unknown target {target!r}.",
@@ -265,11 +295,19 @@ def handle_request(payload):
                      f"{rec.get('duration')!r}.",
                      title="JIT request rejected", tags=["no_entry"])
         return
-    if not pubkey.startswith(("ssh-", "ecdsa-", "sk-")):
+    if (
+        not isinstance(pubkey, str)
+        or len(pubkey) > MAX_PUBKEY_BYTES
+        or CTRL_CHAR_RE.search(pubkey)
+        or not pubkey.startswith(("ssh-", "ecdsa-", "sk-"))
+    ):
         log("rejecting request with no/invalid pubkey")
         return
 
+    reason = sanitize_reason(raw_reason)
+    rec["req_id"] = req_id
     rec["duration"] = duration
+    rec["reason"] = reason
     token = secrets.token_urlsafe(32)
     with _lock:
         _pending[token] = {"record": rec, "expiry": time.time() + TOKEN_TTL}

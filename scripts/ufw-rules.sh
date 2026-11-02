@@ -24,12 +24,14 @@ ufw default deny incoming
 ufw default allow outgoing
 
 # SSH admin — restrict to specific hosts if your posture warrants it.
-ufw allow 22/tcp comment "ssh admin"
+ufw allow from "$LAN_SUBNET" to any port 22 proto tcp comment "ssh admin (LAN)"
+ufw allow from "$VPN_SUBNET" to any port 22 proto tcp comment "ssh admin (VPN)"
 
 # ntfy server — LAN clients + the local approver publish here.
 # (The approver on this same box reaches ntfy via loopback, which ufw doesn't
 # filter by default; this rule covers external LAN clients only.)
 ufw allow from "$LAN_SUBNET" to any port 8080 proto tcp comment "ntfy (LAN)"
+ufw allow from "$VPN_SUBNET" to any port 8080 proto tcp comment "ntfy (VPN)"
 
 # Approve/Deny webhook. MUST allow BOTH subnets: the phone taps from the LAN
 # and from the VPN tunnel when away. Dropping either silently breaks the Approve

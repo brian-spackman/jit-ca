@@ -122,13 +122,14 @@ Runs on the CA host. Two responsibilities:
 **A. Subscribe to the `requests` topic.** For each incoming request:
 
 - Validate the target against an allowlist and the requested duration against a hard cap. Reject anything outside policy, and notify the human of the rejection (do not silently drop it). Each allowlist entry should also record which principal to sign for on that target — this is the target→principal mapping the signing step below relies on; without it, "scoped to the mapped principal" has nothing to look up.
-- Generate a single-use, short-lived (e.g. 10-minute) approval token and store the request details against it, server-side only.
+- Validate `req_id` (hex), `pubkey` length/single-line bounds, and strip control/newline characters from `reason` (truncating to a safe display length).
+- Generate a single-use, short-lived (e.g. 5-minute, matching the client timeout) approval token and store the request details against it, server-side only.
 - Publish an actionable notification to the `approvals` topic with two buttons — **Approve** and **Deny** — each configured to POST the token to the daemon's own webhook, at `/approve` and `/deny` respectively.
 
 **B. Serve a small webhook**, reachable only from the trusted network (or a VPN), handling:
 
 - **`/approve`**: look up the token; if valid and unused, mark it consumed (tokens must be single-use — no replay), invoke the CA to sign a certificate for the request's public key, scoped to the mapped principal and capped at the requested duration, publish the resulting certificate to the `certificates` topic, and write an audit record (timestamp, target, duration, reason, request id, validity window, outcome).
-- **`/deny`**: look up the token, mark it consumed, write an audit record for the denial. By default, publish nothing further — the agent will simply time out, same as an un-tapped request. Optionally, to let the agent's client exit early instead of waiting out its full timeout, publish a generic message to `certificates` (e.g. `{request_id, certificate: null}`) — the same shape you'd use for any other terminal non-issuance state (a validation rejection, a signing failure). Either way, the agent should never be able to tell *why* no certificate arrived — only that one didn't.
+- **`/deny`**: look up the token, mark it consumed, write an audit record for the denial, and confirm the denial on `approvals` (human-visible) — but publish **nothing** to `certificates`. The agent simply times out, same as an un-tapped request, so the agent can never distinguish an active human denial from silence.
 - Log every outcome (approve, deny, rejected, signing failure) to both a durable audit log and wherever your normal service logging goes. Treat the deny path with the same log-completeness bar as the approve path — it is easy to build and test approve repeatedly while deny goes completely unexercised.
 
 ### 5.4 The agent-side client
@@ -147,7 +148,7 @@ Wire the agent's SSH client configuration so that connecting to a target uses th
 Per target, one-time setup, additive and reversible (safe to do over an existing admin session):
 
 1. Create a dedicated service account for the agent's identity on that host — no password, no standing `authorized_keys` entries, only the group memberships/sudo rights it genuinely needs for its work there.
-2. Install the CA's user-certificate public key as a trusted issuer for SSH authentication on that host, and point sshd at it via the standard OpenSSH `TrustedUserCAKeys` directive.
+2. Install the CA's user-certificate public key as a trusted issuer for SSH authentication on that host (`TrustedUserCAKeys`), and bind the target's service user to its per-target principal (`agent@<target>`) via `AuthorizedPrincipalsFile /etc/ssh/jit_ca_principals/%u` (`/etc/ssh/jit_ca_principals/agent`) so a certificate issued for Target A is rejected by Target B and cannot authenticate as `root`.
 3. Validate the sshd configuration syntactically **before** reloading it, and keep a fallback session open while you do — a bad config plus a reload is how you lock yourself out.
    - Be aware some systems run sshd as a socket-activated service, where configuration is read fresh on each new connection rather than requiring a reload/restart at all. Check which kind you have before assuming a reload is necessary or safe.
 4. Add the target to the approval daemon's allowlist and restart it.
@@ -160,7 +161,7 @@ Once the certificate path is verified working on a target, add a human-held reco
 
 1. The human generates a keypair themselves, entirely outside any system the agent can read from — a password manager's key-generation feature, or an offline `ssh-keygen` run, works well. The private key is never written anywhere the agent can access it.
 2. Only the **public** half is shared with the agent, over the same kind of one-way, agent-read-only channel used for other out-of-band secrets.
-3. The agent installs that public key as the *sole* entry in the target's standing `authorized_keys` for its service account. If this target is being retrofitted onto the system rather than built fresh via 5.5 (which creates the account with no standing key to begin with), this step *replaces* whatever pre-existing key was there — never leave both a prior standing key and the break-glass key in place at once.
+3. The agent installs that public key as the *sole* entry in the target's standing `authorized_keys` for its service account. If this target is being retrofitted onto the system rather than built fresh via 5.5 (which creates the account with no standing key to begin with), this step *replaces* whatever pre-existing key was there — never leave both a prior standing key and the break-glass key in place at once. Verify the installed public key's fingerprint out-of-band to confirm no substitution occurred during installation.
 4. The matching private key is handed to the agent only if the certificate path itself becomes unavailable (the CA host down, the notification channel down, a target's trust configuration broken) — a deliberate, rare, human-initiated act, never a routine credential kept on hand.
 
 Net result: no machine in the fleet holds a private key that lets the agent bypass the tap-to-approve gate, while the human retains a recovery path that doesn't depend on the CA's own uptime.

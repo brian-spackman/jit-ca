@@ -149,11 +149,11 @@ curl -sk https://localhost:9000/health     # -> {"status":"ok"}
 ```bash
 sudo -u step env STEPPATH=/etc/jit-ca step ssh certificate \
   --provisioner jit-ssh \
-  --principal agent \
+  --principal agent@target-host-1 \
   --not-after 1h \
   --sign --force \
-  agent /path/to/agent_key.pub
-# inspect: ssh-keygen -L -f agent_key-cert.pub  → confirm  Principals: agent  and the validity window
+  agent@target-host-1 /path/to/agent_key.pub
+# inspect: ssh-keygen -L -f agent_key-cert.pub  → confirm  Principals: agent@target-host-1  and the validity window
 ```
 
 > **Scope your principals.** Always pass `--principal`. A cert with an *empty* principals list is valid for **any** username on a trusting host. Verify with `ssh-keygen -L` that `Principals:` lists exactly your intended principal, and confirm other users (e.g. `root`) are denied (Section 11).
@@ -174,7 +174,7 @@ auth-file: "/var/lib/ntfy/user.db"
 auth-default-access: "deny-all"        # critical: topics are private by default
 cache-file: "/var/lib/ntfy/cache.db"
 cache-duration: "12h"                  # lets the agent poll for its cert reliably
-behind-proxy: true                     # if fronted by a reverse proxy
+behind-proxy: false                    # set true ONLY when behind a trusted TLS reverse proxy (Section 4.4)
 enable-signup: false
 enable-login: true
 ```
@@ -231,7 +231,8 @@ To approve while away from home, the phone must reach two things: the ntfy serve
 **Job 1 — subscribe to `jit-requests`.** For each request `{req_id, target, duration, reason, pubkey}` it:
 
 - validates `target` against a `TARGET_ALLOWLIST` and `duration` against a hard cap (e.g. 8h);
-- stashes the full request server-side under a freshly generated **single-use, ~10-minute token**;
+- validates `req_id` (strict hex), `pubkey` (single-line, <=2048B), and sanitizes/truncates `reason` (stripping control/newline chars, <=200 chars);
+- stashes the full request server-side under a freshly generated **single-use, 5-minute token** (`TOKEN_TTL = 300`, matching the client timeout);
 - publishes an **actionable notification** to `jit-approvals` titled e.g. *"Agent wants SSH access — TARGET for DURATION: REASON"*, carrying two HTTP-action buttons, **Approve** and **Deny**, each POSTing the token to the approver's own webhook.
 
 > **OFI: externalize the allowlist.** `TARGET_ALLOWLIST` is a hardcoded Python set in the reference script. That's fine for a handful of targets, but it means every fleet change is a code edit and a restart. A cleaner design is a separate config file (YAML works well) that the script reads at startup — easier to manage as the fleet grows, and it decouples allowlist changes from touching code at all.
@@ -239,11 +240,11 @@ To approve while away from home, the phone must reach two things: the ntfy serve
 **Job 2 — serve a tiny webhook** (`/approve`, `/deny`) bound to the LAN IP. On a valid **Approve**:
 
 - it looks up the stashed request by token, marks the token consumed (single-use — replay is rejected);
-- calls `step ssh certificate --provisioner PROVISIONER --principal PRINCIPAL --not-after <duration> --sign --force PRINCIPAL <agent_pubkey>`;
+- calls `step ssh certificate --provisioner PROVISIONER --principal PRINCIPAL@<target> --not-after <duration> --sign --force PRINCIPAL@<target> <agent_pubkey>` (binding the certificate to that specific target host);
 - publishes the resulting **cert** to `jit-certs`;
 - appends a line to an audit log (`SIGN` / `DENY` / `SIGN_FAIL` with timestamp, target, duration, reason, req_id, validity window) **and** to the system journal, so both a durable audit trail and quick `journalctl` visibility exist for every outcome.
 
-On **Deny**, do the mirror-image of Approve, deliberately: burn the token, write the audit line, log it — but do **not** publish anything distinguishing to the topic the agent can read (`jit-certs`). If you want the agent's CLI to exit quickly on a deny instead of running out the full timeout, publish a *generic* close-out message there (`{"req_id": ..., "cert": null}`) — the same message shape a future `SIGN_FAIL` or other terminal-without-a-cert state would use. The agent's client only ever learns "no cert is coming," never *why* — deny, error, and timeout are indistinguishable from its side. That's a deliberate security property, not an oversight: if the agent is ever the compromised party, it should never learn whether a human is actively watching and rejecting it versus simply not having looked yet.
+On **Deny**, do the mirror-image of Approve, deliberately: burn the token, write the audit line, log it, and confirm the denial on `jit-approvals` (human-visible) — but publish **nothing** to the topic the agent can read (`jit-certs`). The agent's client simply runs out its timeout; deny, error, and timeout are completely indistinguishable from its side. That's a deliberate security property, not an oversight: if the agent is ever the compromised party, it never learns whether a human is actively watching and rejecting it versus simply not having looked yet.
 
 > **Log Deny with the same completeness as Approve.** It's tempting to treat Deny as the trivial mirror image of Approve and give it lighter logging — but a Deny path that only writes the audit file and skips the journal means a live deny tap produces zero visible signal in `journalctl`. That looks exactly like "the phone's tap isn't reaching the daemon," a plausible and much scarier-looking client-side bug, when the real fault is a missing log call on one branch of the server. Give Approve and Deny identical logging coverage from the start, and test Deny explicitly and early — see the Known Gotchas section (Section 14) for why untested paths are the ones that bite.
 
@@ -274,6 +275,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+LogsDirectory=jit-ca
 ReadWritePaths=/var/log/jit-ca
 ReadOnlyPaths=/etc/jit-ca
 
@@ -334,9 +336,17 @@ One-time per machine. **Additive and reversible** — do it over an existing adm
 
    ```bash
    sudo install -m 644 -o root -g root ssh_user_ca_key.pub /etc/ssh/trusted_user_ca_keys
-   echo 'TrustedUserCAKeys /etc/ssh/trusted_user_ca_keys' \
-     | sudo tee /etc/ssh/sshd_config.d/10-jit-ca.conf
-   sudo sshd -t && sudo systemctl reload ssh   # validate THEN reload; keep your session open
+   # Bind this target AND the `agent` user to its per-host certificate principal
+   # (agent@<target-hostname>, where <target-hostname> matches TARGET_ALLOWLIST)
+   # using %u so the cert cannot authenticate as root or any other local user:
+   sudo install -d -m 755 -o root -g root /etc/ssh/jit_ca_principals
+   echo "agent@$(hostname -s)" | sudo tee /etc/ssh/jit_ca_principals/agent
+   sudo chmod 644 /etc/ssh/jit_ca_principals/agent
+   sudo tee /etc/ssh/sshd_config.d/10-jit-ca.conf >/dev/null <<'EOF'
+   TrustedUserCAKeys /etc/ssh/trusted_user_ca_keys
+   AuthorizedPrincipalsFile /etc/ssh/jit_ca_principals/%u
+   EOF
+   sudo sshd -t && (sudo systemctl reload ssh 2>/dev/null || sudo kill -HUP $(cat /run/sshd.pid))   # validate THEN reload; keep your session open
    ```
 
    > **Socket-activated sshd gotcha (Debian 13+).** On distros where `ssh.socket` triggers `ssh.service` per-connection, `reload`/`restart` on the service can report failure or even knock out the listener, because there's no long-running instance to signal — yet the config is already live for the *next* connection regardless, since it's read fresh each time. Check `systemctl status ssh.socket` first; if it's socket-activated, skip the reload entirely and just reconnect — don't restart anything, and always keep a fallback session open before touching sshd config either way.
@@ -351,7 +361,7 @@ That's it — targets need **no** ntfy, no webhook, no extra firewall rules (onl
 
 ```bash
 jit-request target-host 30m "onboarding test"     # tap Approve on your phone
-ssh-keygen -L -f ~/.ssh/jit-ca/agent_key-cert.pub  # Principals: agent ; ~30m window
+ssh-keygen -L -f ~/.ssh/jit-ca/agent_key-cert.pub  # Principals: agent@target-host ; ~30m window
 ssh target-host 'id'                               # logs in as agent
 # wait out the TTL → ssh target-host now fails: cert is the only path, and it expired
 ```
@@ -364,8 +374,10 @@ On `CA_HOST`, default-deny inbound and allow exactly three things:
 
 ```bash
 sudo ufw default deny incoming
-sudo ufw allow 22/tcp                                          # admin SSH
-sudo ufw allow from 10.0.0.0/24 to any port 8080 proto tcp     # ntfy   (LAN only)
+sudo ufw allow from 10.0.0.0/24 to any port 22 proto tcp       # admin SSH (LAN)
+sudo ufw allow from 10.5.0.0/24 to any port 22 proto tcp       # admin SSH (VPN)
+sudo ufw allow from 10.0.0.0/24 to any port 8080 proto tcp     # ntfy (LAN)
+sudo ufw allow from 10.5.0.0/24 to any port 8080 proto tcp     # ntfy (VPN)
 sudo ufw allow from 10.0.0.0/24 to any port 8081 proto tcp     # approver webhook (LAN)
 sudo ufw allow from 10.5.0.0/24 to any port 8081 proto tcp     # approver webhook (VPN — add if approving off-LAN)
 sudo ufw --force enable
@@ -400,7 +412,7 @@ The fix: **a break-glass keypair per target, generated and held entirely by you,
 
 - Generate the keypair yourself — a password manager with SSH key generation (1Password, Bitwarden) works well, or any offline `ssh-keygen` you control. The private key **never** touches `AGENT_HOST` or any agent-writable storage.
 - Share only the **public** half with the agent, so it can install it — over whatever one-way channel you use to drop secrets to the agent (for example, a dedicated ntfy topic with the same `jit-certs`-style read-only ACL for the agent account).
-- The agent installs that public key into the target's `authorized_keys`, **replacing** any standing key left over from the target's initial build — never leave both in place at once.
+- The agent installs that public key into the target's `authorized_keys`, **replacing** any standing key left over from the target's initial build — never leave both in place at once. Verify the installed key's `ssh-keygen -lf` fingerprint out-of-band before removing your initial admin session so a compromised agent cannot substitute its own key.
 - Hand over the matching private key only if the tap-to-sign path itself breaks. This should be rare and deliberate, not a routine credential you keep on hand.
 
 Net effect: **no machine in the fleet retains a private key that lets the agent bypass the tap-to-sign gate**, while you retain a recovery path independent of the CA's own uptime. Roll this out per target only *after* verifying the cert path works end-to-end on that target — the break-glass key should be a strictly-worse fallback, never the first thing you reach for.
@@ -423,7 +435,7 @@ Net effect: **no machine in the fleet retains a private key that lets the agent 
 
 - **"Approve does nothing."** In order: (1) is the webhook port allowed in ufw? (Section 8.) (2) `systemctl status jit-ca-approver` and its journal — a `publish failed` line points at an ntfy token/ACL problem; an `invalid/expired/used token` line means the prompt aged out (>token TTL) — just re-request. (3) Off-LAN? See Section 4.4.
 - **"Cert never reaches the agent."** Poll `jit-certs` with the agent token; if the cert is there, `jit-request` was killed before it could write it; if not, check the approver's `SIGN_FAIL` audit lines.
-- **Confirm principal scoping.** `ssh-keygen -L -f <cert>` must show `Principals: <your principal>`. Confirm a *different* user is denied on a target with that cert (a quick `ssh otheruser@target` should fail) — this catches an accidental empty-principal "valid for all users" cert.
+- **Confirm principal & target scoping.** `ssh-keygen -L -f <cert>` must show `Principals: agent@<target>`. Confirm both that a *different* user on that target (`ssh root@target`) and the *same* user on a *different* target (`ssh agent@other-target`) are denied.
 - **Audit.** Everything funnels through one chokepoint, so the approver's audit log plus each target's sshd logs (which record the cert serial on login) give you a full who/what/when/why.
 - **Test Deny, not just Approve.** It's the path most likely to sit unexercised — see the callout in Section 5. Fire a request, deny it deliberately, and confirm you see the signal you expect *before* you need Deny to matter for real.
 

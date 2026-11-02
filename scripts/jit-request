@@ -103,10 +103,8 @@ def main():
                 body = json.loads(ev.get("message", ""))
             except json.JSONDecodeError:
                 continue
-            if body.get("req_id") != req_id:
+            if body.get("req_id") != req_id or not body.get("cert"):
                 continue
-            if not body.get("cert"):
-                die("request closed — no cert issued", 2)
             CERT.write_text(body["cert"].strip() + "\n")
             os.chmod(CERT, 0o644)
             out = subprocess.run(["ssh-keygen", "-L", "-f", str(CERT)],

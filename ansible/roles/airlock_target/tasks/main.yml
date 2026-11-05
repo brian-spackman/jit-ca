@@ -1,0 +1,140 @@
+---
+- name: Validate airlock_user_ca_pubkey is provided
+  ansible.builtin.assert:
+    that:
+      - airlock_user_ca_pubkey is string
+      - airlock_user_ca_pubkey | trim | length > 20
+      - (airlock_user_ca_pubkey | trim).startswith(('ecdsa-', 'ssh-ed25519', 'ssh-rsa', 'sk-'))
+    fail_msg: "airlock_user_ca_pubkey must be set to the contents of certs/ssh_user_ca_key.pub from the Airlock host."
+
+- name: Ensure principal group exists when explicit UID/GID is requested
+  ansible.builtin.group:
+    name: "{{ airlock_principal_user }}"
+    gid: "{{ airlock_principal_uid }}"
+    state: present
+  when: airlock_principal_uid is not none
+
+- name: Ensure Airlock principal user exists with locked password
+  ansible.builtin.user:
+    name: "{{ airlock_principal_user }}"
+    uid: "{{ airlock_principal_uid if airlock_principal_uid is not none else omit }}"
+    group: "{{ airlock_principal_user if airlock_principal_uid is not none else omit }}"
+    groups: "{{ airlock_principal_groups }}"
+    append: true
+    shell: "{{ airlock_principal_shell }}"
+    create_home: true
+    password_lock: true
+    state: present
+
+- name: Configure passwordless sudo for Airlock principal user
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ airlock_principal_user }}"
+    content: "{{ airlock_principal_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "/usr/sbin/visudo -cf %s"
+  when: airlock_sudo_nopasswd | bool
+
+- name: Install trusted SSH User CA public key
+  ansible.builtin.copy:
+    dest: "{{ airlock_trusted_ca_keys_path }}"
+    content: "{{ (airlock_user_ca_pubkey | trim) ~ '\n' }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sshd safely
+
+- name: Create AuthorizedPrincipals directory
+  ansible.builtin.file:
+    path: "{{ airlock_principals_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure per-target principal binding ({{ airlock_principal_user }}@{{ airlock_target_name }})
+  ansible.builtin.copy:
+    dest: "{{ airlock_principals_dir }}/{{ airlock_principal_user }}"
+    content: |
+      {% if airlock_include_generic_principal | bool %}
+      {{ airlock_principal_user }}@{{ airlock_target_name }}
+      {% endif %}
+      {% for approver in (airlock_allowed_approvers | default([])) %}
+      approved-by-{{ approver }}@{{ airlock_target_name }}
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure sshd drop-in for Airlock user certificates and principals
+  ansible.builtin.copy:
+    dest: "{{ airlock_sshd_dropin_path }}"
+    content: |
+      TrustedUserCAKeys {{ airlock_trusted_ca_keys_path }}
+      AuthorizedPrincipalsFile {{ airlock_principals_dir }}/%u
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sshd safely
+
+- name: Validate sshd configuration syntax
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: false
+  check_mode: false
+
+- name: Ensure ~/.ssh directory exists for principal user
+  ansible.builtin.file:
+    path: "/home/{{ airlock_principal_user }}/.ssh"
+    state: directory
+    owner: "{{ airlock_principal_user }}"
+    group: "{{ airlock_principal_user }}"
+    mode: "0700"
+  when: airlock_manage_authorized_keys | bool
+
+- name: Configure ~/.ssh/authorized_keys (break-glass key + any explicit extra keys only)
+  ansible.builtin.copy:
+    dest: "/home/{{ airlock_principal_user }}/.ssh/authorized_keys"
+    content: |
+      {% if airlock_break_glass_pubkey is string and (airlock_break_glass_pubkey | trim | length > 0) %}
+      {{ airlock_break_glass_pubkey | trim }}
+      {% endif %}
+      {% if airlock_extra_authorized_keys is sequence and airlock_extra_authorized_keys is not string %}
+      {% for key in airlock_extra_authorized_keys if (key is string and (key | trim | length > 0)) %}
+      {{ key | trim }}
+      {% endfor %}
+      {% endif %}
+    owner: "{{ airlock_principal_user }}"
+    group: "{{ airlock_principal_user }}"
+    mode: "0600"
+    backup: true
+  when: airlock_manage_authorized_keys | bool
+
+- name: Install optional Proxmox hypervisor host-identity hookscript (when enabled)
+  block:
+    - name: Ensure Proxmox snippets directory exists
+      ansible.builtin.file:
+        path: "{{ airlock_proxmox_snippets_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install inject-host-identity.sh Proxmox hookscript
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../contrib/proxmox-hypervisor-guard/inject-host-identity.sh"
+        dest: "{{ airlock_proxmox_snippets_dir }}/inject-host-identity.sh"
+        owner: root
+        group: root
+        mode: "0755"
+  when: airlock_hypervisor_guard_enabled | bool
+
+- name: Scrub Day-0 birth public key from /root/.ssh/authorized_keys (when present)
+  ansible.builtin.lineinfile:
+    path: /root/.ssh/authorized_keys
+    line: "{{ airlock_purge_birth_pubkey | trim }}"
+    state: absent
+  when:
+    - airlock_purge_birth_pubkey is string
+    - airlock_purge_birth_pubkey | trim | length > 0
+  failed_when: false

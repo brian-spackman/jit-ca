@@ -1,5 +1,5 @@
 [Unit]
-Description=jit-ca approver — tap-to-sign SSH JIT approval daemon
+Description=airlock-approver — out-of-band tap-to-sign approval & attestation daemon
 After=network-online.target ntfy.service step-ca.service
 Wants=network-online.target
 Requires=ntfy.service step-ca.service
@@ -8,7 +8,7 @@ Requires=ntfy.service step-ca.service
 Type=simple
 User=step
 Group=step
-ExecStart=/usr/bin/python3 /usr/local/bin/jit-ca-approver
+ExecStart=/usr/bin/python3 /usr/local/bin/airlock-approver
 Restart=on-failure
 RestartSec=5
 # hardening
@@ -16,9 +16,9 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-LogsDirectory=jit-ca
-ReadWritePaths=/var/log/jit-ca
-ReadOnlyPaths=/etc/jit-ca
+LogsDirectory=airlock
+ReadWritePaths=/var/log/airlock
+ReadOnlyPaths=/etc/airlock
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

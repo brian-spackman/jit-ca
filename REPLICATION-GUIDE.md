@@ -1,8 +1,8 @@
-# Homelab JIT-CA — replication guide
+# Homelab Airlock — replication guide
 
 A complete, reproducible build of just-in-time SSH elevation for an AI agent (or any low-trust automation), using `step-ca`, `ntfy`, and OpenSSH certificates. Written to be read by a careful human *or* handed to a capable coding agent as a build spec.
 
-Read [README.md](./README.md) first for the "what" and "why". This document is the "how" — a narrative build with real gotchas and the reasoning behind each step. If you'd rather have a single, leaner, tool-agnostic document instead, see [JIT-CA-SPEC.md](./JIT-CA-SPEC.md).
+Read [README.md](./README.md) first for the "what" and "why". This document is the "how" — a narrative build with real gotchas and the reasoning behind each step. If you'd rather have a single, leaner, tool-agnostic document instead, see [AIRLOCK-SPEC.md](./AIRLOCK-SPEC.md).
 
 ---
 
@@ -19,12 +19,12 @@ This guide uses placeholders. Substitute your own values; nothing here is secret
 | `VPN_CIDR` | Your VPN subnet (optional, for off-LAN approval) | `10.5.0.0/24` |
 | `NTFY_FQDN` | Public name for ntfy (optional, for off-LAN approval) | `ntfy.example.net` |
 | `PRINCIPAL` | The SSH cert principal == service username on targets | `agent` |
-| `PROVISIONER` | step-ca SSH provisioner name | `jit-ssh` |
-| `STEPPATH` | step-ca config/state dir | `/etc/jit-ca` |
+| `PROVISIONER` | step-ca SSH provisioner name | `airlock-ssh` |
+| `STEPPATH` | step-ca config/state dir | `/etc/airlock` |
 
 Reference versions (pin these — `step-ca`'s SSH CA flags have drifted across releases): **step-cli 0.30.6, step-ca 0.30.2, ntfy 2.24.0**, OpenSSH 9.x, Debian 12/13.
 
-This guide is descriptive, not a script drop — it names two pieces, **`jit-ca-approver.py`** (the approval daemon) and **`jit-request`** (the agent CLI), and explains exactly what each one does and how to wire it, in enough detail to implement from scratch (Sections 5–7 are the concrete build steps). Sanitized reference implementations of both scripts (plus the systemd unit and the ufw rules) are in the [`scripts/`](./scripts/) directory — read the narrative here first, then use those as a starting point rather than building from scratch.
+This guide is descriptive, not a script drop — it names two pieces, **`airlock-approver.py`** (the approval daemon) and **`airlock-request`** (the agent CLI), and explains exactly what each one does and how to wire it, in enough detail to implement from scratch (Sections 5–7 are the concrete build steps). Sanitized reference implementations of both scripts (plus the systemd unit and the ufw rules) are in the [`scripts/`](./scripts/) directory — read the narrative here first, then use those as a starting point rather than building from scratch.
 
 ---
 
@@ -67,8 +67,8 @@ On `CA_HOST`:
 ```bash
 # Install step-cli + step-ca (pin versions). Smallstep publishes .deb packages.
 # Then create a dedicated, unprivileged service user that owns the CA state.
-sudo useradd --system --home-dir /etc/jit-ca --shell /usr/sbin/nologin step
-export STEPPATH=/etc/jit-ca
+sudo useradd --system --home-dir /etc/airlock --shell /usr/sbin/nologin step
+export STEPPATH=/etc/airlock
 ```
 
 Initialize the CA. We only need the **SSH** CA features (not X.509 issuance), but `step ca init` sets up the root/intermediate scaffold and the SSH user/host keys in one go:
@@ -76,13 +76,13 @@ Initialize the CA. We only need the **SSH** CA features (not X.509 issuance), bu
 ```bash
 sudo -u step env STEPPATH=$STEPPATH step ca init \
   --ssh \
-  --name "homelab-jit-ca" \
+  --name "homelab-airlock" \
   --dns "localhost" \
   --address "127.0.0.1:9000" \
-  --provisioner "jit-ssh"
+  --provisioner "airlock-ssh"
 ```
 
-> **Provisioner name:** the `--provisioner` value becomes the provisioner name in `config/ca.json` and must match `PROVISIONER` in `jit-ca-approver.py`. The approver script (and this guide) use `jit-ssh` throughout; the `step ca init` command above already passes that value. If you use a different name, update `PROVISIONER` in the script to match.
+> **Provisioner name:** the `--provisioner` value becomes the provisioner name in `config/ca.json` and must match `PROVISIONER` in `airlock-approver.py`. The approver script (and this guide) use `airlock-ssh` throughout; the `step ca init` command above already passes that value. If you use a different name, update `PROVISIONER` in the script to match.
 
 This writes under `$STEPPATH`:
 
@@ -97,12 +97,12 @@ Enable SSH CA on the provisioner. In `config/ca.json`, the SSH provisioner block
 
 ```jsonc
 "ssh": {
-  "hostKey": "/etc/jit-ca/secrets/ssh_host_ca_key",
-  "userKey": "/etc/jit-ca/secrets/ssh_user_ca_key"
+  "hostKey": "/etc/airlock/secrets/ssh_host_ca_key",
+  "userKey": "/etc/airlock/secrets/ssh_user_ca_key"
 },
 "authority": {
   "provisioners": [
-    { "type": "JWK", "name": "jit-ssh", "key": { /* … */ },
+    { "type": "JWK", "name": "airlock-ssh", "key": { /* … */ },
       "encryptedKey": "…", "claims": { "enableSSHCA": true } }
   ]
 }
@@ -121,15 +121,15 @@ Wants=network-online.target
 Type=simple
 User=step
 Group=step
-Environment=STEPPATH=/etc/jit-ca
-ExecStart=/usr/bin/step-ca /etc/jit-ca/config/ca.json --password-file /etc/jit-ca/secrets/password
+Environment=STEPPATH=/etc/airlock
+ExecStart=/usr/bin/step-ca /etc/airlock/config/ca.json --password-file /etc/airlock/secrets/password
 ExecReload=/bin/kill --signal HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 # hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/etc/jit-ca/db
+ReadWritePaths=/etc/airlock/db
 ProtectHome=true
 PrivateTmp=true
 
@@ -147,8 +147,8 @@ curl -sk https://localhost:9000/health     # -> {"status":"ok"}
 **Signing an SSH cert** (this is what the approver calls — verify it works manually first):
 
 ```bash
-sudo -u step env STEPPATH=/etc/jit-ca step ssh certificate \
-  --provisioner jit-ssh \
+sudo -u step env STEPPATH=/etc/airlock step ssh certificate \
+  --provisioner airlock-ssh \
   --principal agent@target-host-1 \
   --not-after 1h \
   --sign --force \
@@ -194,29 +194,29 @@ sudo ntfy user add agent           # the agent on AGENT_HOST
 sudo ntfy user add phone           # you
 
 # topic ACLs
-#   jit-requests : agent → CA       (the ask)
-#   jit-approvals: CA → phone       (the actionable notification + token)
-#   jit-certs    : CA → agent       (the signed cert)
+#   airlock-requests : agent → CA       (the ask)
+#   airlock-approvals: CA → phone       (the actionable notification + token)
+#   airlock-certs    : CA → agent       (the signed cert)
 
-sudo ntfy access approver jit-requests  read-only
-sudo ntfy access approver jit-approvals write-only
-sudo ntfy access approver jit-certs     write-only
+sudo ntfy access approver airlock-requests  read-only
+sudo ntfy access approver airlock-approvals write-only
+sudo ntfy access approver airlock-certs     write-only
 
-sudo ntfy access agent    jit-requests  write-only
-sudo ntfy access agent    jit-certs     read-only
-#   NOTE: agent gets NO access to jit-approvals — it can never see approval tokens.
+sudo ntfy access agent    airlock-requests  write-only
+sudo ntfy access agent    airlock-certs     read-only
+#   NOTE: agent gets NO access to airlock-approvals — it can never see approval tokens.
 
-sudo ntfy access phone    jit-approvals read-write
-sudo ntfy access phone    jit-requests  read-write
+sudo ntfy access phone    airlock-approvals read-write
+sudo ntfy access phone    airlock-requests  read-write
 ```
 
-> **OFI: phone access is read-write, not read-only.** The `phone` account is granted read-write on both topics above mainly because it wasn't obvious how to get a read-only subscription working in the ntfy mobile app for the approvals topic. Read-write is broader than the phone strictly needs (it never needs to *publish* to `jit-requests`, for instance) — a reasonable simplification for a homelab, but worth tightening if your threat model calls for it.
+> **OFI: phone access is read-write, not read-only.** The `phone` account is granted read-write on both topics above mainly because it wasn't obvious how to get a read-only subscription working in the ntfy mobile app for the approvals topic. Read-write is broader than the phone strictly needs (it never needs to *publish* to `airlock-requests`, for instance) — a reasonable simplification for a homelab, but worth tightening if your threat model calls for it.
 
-Generate access tokens for the `approver` and `agent` accounts (`ntfy token add <user>`). The approver reads its token from a secrets file on `CA_HOST`; the agent stores its token at `~/.config/jit-ca/ntfy-agent-token` on `AGENT_HOST`.
+Generate access tokens for the `approver` and `agent` accounts (`ntfy token add <user>`). The approver reads its token from a secrets file on `CA_HOST`; the agent stores its token at `~/.config/airlock/ntfy-agent-token` on `AGENT_HOST`.
 
 ### 4.3 Connect your phone
 
-Install the ntfy app, point it at your server (`https://NTFY_FQDN`, or the LAN URL), log in as the `phone` user, and subscribe to `jit-approvals`. Send yourself a test message to confirm delivery before relying on it.
+Install the ntfy app, point it at your server (`https://NTFY_FQDN`, or the LAN URL), log in as the `phone` user, and subscribe to `airlock-approvals`. Send yourself a test message to confirm delivery before relying on it.
 
 ### 4.4 Off-LAN approval (optional)
 
@@ -226,14 +226,14 @@ To approve while away from home, the phone must reach two things: the ntfy serve
 
 ## 5. The approver daemon
 
-`jit-ca-approver.py` runs on `CA_HOST` (as the `step` user) and does two jobs:
+`airlock-approver.py` runs on `CA_HOST` (as the `step` user) and does two jobs:
 
-**Job 1 — subscribe to `jit-requests`.** For each request `{req_id, target, duration, reason, pubkey}` it:
+**Job 1 — subscribe to `airlock-requests`.** For each request `{req_id, target, duration, reason, pubkey}` it:
 
 - validates `target` against a `TARGET_ALLOWLIST` and `duration` against a hard cap (e.g. 8h);
 - validates `req_id` (strict hex), `pubkey` (single-line, <=2048B), and sanitizes/truncates `reason` (stripping control/newline chars, <=200 chars);
 - stashes the full request server-side under a freshly generated **single-use, 5-minute token** (`TOKEN_TTL = 300`, matching the client timeout);
-- publishes an **actionable notification** to `jit-approvals` titled e.g. *"Agent wants SSH access — TARGET for DURATION: REASON"*, carrying two HTTP-action buttons, **Approve** and **Deny**, each POSTing the token to the approver's own webhook.
+- publishes an **actionable notification** to `airlock-approvals` titled e.g. *"Agent wants SSH access — TARGET for DURATION: REASON"*, carrying two HTTP-action buttons, **Approve** and **Deny**, each POSTing the token to the approver's own webhook.
 
 > **OFI: externalize the allowlist.** `TARGET_ALLOWLIST` is a hardcoded Python set in the reference script. That's fine for a handful of targets, but it means every fleet change is a code edit and a restart. A cleaner design is a separate config file (YAML works well) that the script reads at startup — easier to manage as the fleet grows, and it decouples allowlist changes from touching code at all.
 
@@ -241,26 +241,26 @@ To approve while away from home, the phone must reach two things: the ntfy serve
 
 - it looks up the stashed request by token, marks the token consumed (single-use — replay is rejected);
 - calls `step ssh certificate --provisioner PROVISIONER --principal PRINCIPAL@<target> --not-after <duration> --sign --force PRINCIPAL@<target> <agent_pubkey>` (binding the certificate to that specific target host);
-- publishes the resulting **cert** to `jit-certs`;
+- publishes the resulting **cert** to `airlock-certs`;
 - appends a line to an audit log (`SIGN` / `DENY` / `SIGN_FAIL` with timestamp, target, duration, reason, req_id, validity window) **and** to the system journal, so both a durable audit trail and quick `journalctl` visibility exist for every outcome.
 
-On **Deny**, do the mirror-image of Approve, deliberately: burn the token, write the audit line, log it, and confirm the denial on `jit-approvals` (human-visible) — but publish **nothing** to the topic the agent can read (`jit-certs`). The agent's client simply runs out its timeout; deny, error, and timeout are completely indistinguishable from its side. That's a deliberate security property, not an oversight: if the agent is ever the compromised party, it never learns whether a human is actively watching and rejecting it versus simply not having looked yet.
+On **Deny**, do the mirror-image of Approve, deliberately: burn the token, write the audit line, log it, and confirm the denial on `airlock-approvals` (human-visible) — but publish **nothing** to the topic the agent can read (`airlock-certs`). The agent's client simply runs out its timeout; deny, error, and timeout are completely indistinguishable from its side. That's a deliberate security property, not an oversight: if the agent is ever the compromised party, it never learns whether a human is actively watching and rejecting it versus simply not having looked yet.
 
 > **Log Deny with the same completeness as Approve.** It's tempting to treat Deny as the trivial mirror image of Approve and give it lighter logging — but a Deny path that only writes the audit file and skips the journal means a live deny tap produces zero visible signal in `journalctl`. That looks exactly like "the phone's tap isn't reaching the daemon," a plausible and much scarier-looking client-side bug, when the real fault is a missing log call on one branch of the server. Give Approve and Deny identical logging coverage from the start, and test Deny explicitly and early — see the Known Gotchas section (Section 14) for why untested paths are the ones that bite.
 
 Key design choices baked into the daemon:
 
 - **Cert over ntfy, not scp.** The cert is a signed public key, so it can travel over the message bus. This is *why* the CA needs no credential pointing at the agent.
-- **The agent never sees the token.** The token lives only in the notification (which the agent account can't read) and the approver's memory. The agent can spam `jit-requests`; it cannot manufacture an approval.
+- **The agent never sees the token.** The token lives only in the notification (which the agent account can't read) and the approver's memory. The agent can spam `airlock-requests`; it cannot manufacture an approval.
 - **Single-use + short TTL tokens.** An un-tapped request simply expires; an approval can't be replayed.
 - **Deny and timeout look identical to the agent.** See above — this is load-bearing for the "the agent cannot learn whether it's being watched" property, not just a UX nicety.
 
-systemd unit (note the dependency ordering and the `ReadOnlyPaths` restriction on the CA dir). The inline block below is abbreviated for readability — `scripts/jit-ca-approver.service` in this repo is the canonical version with full hardening directives; prefer it:
+systemd unit (note the dependency ordering and the `ReadOnlyPaths` restriction on the CA dir). The inline block below is abbreviated for readability — `scripts/airlock-approver.service` in this repo is the canonical version with full hardening directives; prefer it:
 
 ```ini
-# /etc/systemd/system/jit-ca-approver.service
+# /etc/systemd/system/airlock-approver.service
 [Unit]
-Description=jit-ca approver — tap-to-sign SSH JIT approval daemon
+Description=airlock approver — tap-to-sign SSH JIT approval daemon
 After=network-online.target ntfy.service step-ca.service
 Requires=ntfy.service step-ca.service
 
@@ -268,16 +268,16 @@ Requires=ntfy.service step-ca.service
 Type=simple
 User=step
 Group=step
-ExecStart=/usr/bin/python3 /usr/local/bin/jit-ca-approver
+ExecStart=/usr/bin/python3 /usr/local/bin/airlock-approver
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-LogsDirectory=jit-ca
-ReadWritePaths=/var/log/jit-ca
-ReadOnlyPaths=/etc/jit-ca
+LogsDirectory=airlock
+ReadWritePaths=/var/log/airlock
+ReadOnlyPaths=/etc/airlock
 
 [Install]
 WantedBy=multi-user.target
@@ -287,20 +287,20 @@ WantedBy=multi-user.target
 
 ## 6. The agent CLI
 
-`jit-request` runs on `AGENT_HOST`. Usage:
+`airlock-request` runs on `AGENT_HOST`. Usage:
 
 ```bash
-jit-request <target> <duration> "<reason>"
+airlock-request <target> <duration> "<reason>"
 # e.g.
-jit-request target-host 1h "upgrade the app container to v2.0"
+airlock-request target-host 1h "upgrade the app container to v2.0"
 ```
 
 What it does:
 
-1. Ensures an agent keypair exists at `~/.ssh/jit-ca/agent_key` (generates an ed25519 key on first run).
-2. Publishes `{req_id, target, duration, reason, pubkey}` to `jit-requests` using the agent's ntfy token, then **blocks**, printing *"waiting for approval — tap Approve on your phone"*.
-3. Polls `jit-certs` (with a short lookback window — ntfy's 12h cache makes this reliable), filtering by its own `req_id` so a stale cert from a prior request is ignored.
-4. On match, writes the cert to `~/.ssh/jit-ca/agent_key-cert.pub` and prints the validity window. Times out after ~5 minutes if no approval arrives.
+1. Ensures an agent keypair exists at `~/.ssh/airlock-ca/agent_key` (generates an ed25519 key on first run).
+2. Publishes `{req_id, target, duration, reason, pubkey}` to `airlock-requests` using the agent's ntfy token, then **blocks**, printing *"waiting for approval — tap Approve on your phone"*.
+3. Polls `airlock-certs` (with a short lookback window — ntfy's 12h cache makes this reliable), filtering by its own `req_id` so a stale cert from a prior request is ignored.
+4. On match, writes the cert to `~/.ssh/airlock-ca/agent_key-cert.pub` and prints the validity window. Times out after ~5 minutes if no approval arrives.
 
 Wire it into the agent's `~/.ssh/config` so plain `ssh target-host` uses the cert and fails cleanly when there's no valid one:
 
@@ -308,8 +308,8 @@ Wire it into the agent's `~/.ssh/config` so plain `ssh target-host` uses the cer
 Host target-host
   HostName 10.0.0.20
   User agent
-  IdentityFile ~/.ssh/jit-ca/agent_key
-  CertificateFile ~/.ssh/jit-ca/agent_key-cert.pub
+  IdentityFile ~/.ssh/airlock-ca/agent_key
+  CertificateFile ~/.ssh/airlock-ca/agent_key-cert.pub
   IdentitiesOnly yes
 ```
 
@@ -339,19 +339,19 @@ One-time per machine. **Additive and reversible** — do it over an existing adm
    # Bind this target AND the `agent` user to its per-host certificate principal
    # (agent@<target-hostname>, where <target-hostname> matches TARGET_ALLOWLIST)
    # using %u so the cert cannot authenticate as root or any other local user:
-   sudo install -d -m 755 -o root -g root /etc/ssh/jit_ca_principals
-   echo "agent@$(hostname -s)" | sudo tee /etc/ssh/jit_ca_principals/agent
-   sudo chmod 644 /etc/ssh/jit_ca_principals/agent
-   sudo tee /etc/ssh/sshd_config.d/10-jit-ca.conf >/dev/null <<'EOF'
+   sudo install -d -m 755 -o root -g root /etc/ssh/airlock_principals
+   echo "agent@$(hostname -s)" | sudo tee /etc/ssh/airlock_principals/agent
+   sudo chmod 644 /etc/ssh/airlock_principals/agent
+   sudo tee /etc/ssh/sshd_config.d/10-airlock.conf >/dev/null <<'EOF'
    TrustedUserCAKeys /etc/ssh/trusted_user_ca_keys
-   AuthorizedPrincipalsFile /etc/ssh/jit_ca_principals/%u
+   AuthorizedPrincipalsFile /etc/ssh/airlock_principals/%u
    EOF
    sudo sshd -t && (sudo systemctl reload ssh 2>/dev/null || sudo kill -HUP $(cat /run/sshd.pid))   # validate THEN reload; keep your session open
    ```
 
    > **Socket-activated sshd gotcha (Debian 13+).** On distros where `ssh.socket` triggers `ssh.service` per-connection, `reload`/`restart` on the service can report failure or even knock out the listener, because there's no long-running instance to signal — yet the config is already live for the *next* connection regardless, since it's read fresh each time. Check `systemctl status ssh.socket` first; if it's socket-activated, skip the reload entirely and just reconnect — don't restart anything, and always keep a fallback session open before touching sshd config either way.
 
-3. **Allowlist the target** in the approver's `TARGET_ALLOWLIST` on `CA_HOST` and restart `jit-ca-approver`.
+3. **Allowlist the target** in the approver's `TARGET_ALLOWLIST` on `CA_HOST` and restart `airlock-approver`.
 
 4. **Add the `Host` block** to the agent's `~/.ssh/config` (Section 6).
 
@@ -360,8 +360,8 @@ That's it — targets need **no** ntfy, no webhook, no extra firewall rules (onl
 ### Verify
 
 ```bash
-jit-request target-host 30m "onboarding test"     # tap Approve on your phone
-ssh-keygen -L -f ~/.ssh/jit-ca/agent_key-cert.pub  # Principals: agent@target-host ; ~30m window
+airlock-request target-host 30m "onboarding test"     # tap Approve on your phone
+ssh-keygen -L -f ~/.ssh/airlock-ca/agent_key-cert.pub  # Principals: agent@target-host ; ~30m window
 ssh target-host 'id'                               # logs in as agent
 # wait out the TTL → ssh target-host now fails: cert is the only path, and it expired
 ```
@@ -411,7 +411,7 @@ The system as built so far removes every *standing agent* credential — but tha
 The fix: **a break-glass keypair per target, generated and held entirely by you, outside the agent's reach.**
 
 - Generate the keypair yourself — a password manager with SSH key generation (1Password, Bitwarden) works well, or any offline `ssh-keygen` you control. The private key **never** touches `AGENT_HOST` or any agent-writable storage.
-- Share only the **public** half with the agent, so it can install it — over whatever one-way channel you use to drop secrets to the agent (for example, a dedicated ntfy topic with the same `jit-certs`-style read-only ACL for the agent account).
+- Share only the **public** half with the agent, so it can install it — over whatever one-way channel you use to drop secrets to the agent (for example, a dedicated ntfy topic with the same `airlock-certs`-style read-only ACL for the agent account).
 - The agent installs that public key into the target's `authorized_keys`, **replacing** any standing key left over from the target's initial build — never leave both in place at once. Verify the installed key's `ssh-keygen -lf` fingerprint out-of-band before removing your initial admin session so a compromised agent cannot substitute its own key.
 - Hand over the matching private key only if the tap-to-sign path itself breaks. This should be rare and deliberate, not a routine credential you keep on hand.
 
@@ -433,9 +433,9 @@ Net effect: **no machine in the fleet retains a private key that lets the agent 
 
 ## 12. Operations & troubleshooting
 
-- **"Approve does nothing."** In order: (1) is the webhook port allowed in ufw? (Section 8.) (2) `systemctl status jit-ca-approver` and its journal — a `publish failed` line points at an ntfy token/ACL problem; an `invalid/expired/used token` line means the prompt aged out (>token TTL) — just re-request. (3) Off-LAN? See Section 4.4.
-- **"Cert never reaches the agent."** Poll `jit-certs` with the agent token; if the cert is there, `jit-request` was killed before it could write it; if not, check the approver's `SIGN_FAIL` audit lines.
-- **Confirm principal & target scoping.** `ssh-keygen -L -f <cert>` must show `Principals: agent@<target>`. Confirm both that a *different* user on that target (`ssh root@target`) and the *same* user on a *different* target (`ssh agent@other-target`) are denied.
+- **"Approve does nothing."** In order: (1) is the webhook port allowed in ufw? (Section 8.) (2) `systemctl status airlock-approver` and its journal — a `publish failed` line points at an ntfy token/ACL problem; an `invalid/expired/used token` line means the prompt aged out (>token TTL) — just re-request. (3) Off-LAN? See Section 4.4.
+- **"Cert never reaches the agent."** Poll `airlock-certs` with the agent token; if the cert is there, `airlock-request` was killed before it could write it; if not, check the approver's `SIGN_FAIL` audit lines.
+- **Confirm principal & target scoping.** `ssh-keygen -L -f <cert>` must show `Principals: airlock-admin@<target>`. Confirm both that a *different* user on that target (`ssh root@target`) and the *same* user on a *different* target (`ssh agent@other-target`) are denied.
 - **Audit.** Everything funnels through one chokepoint, so the approver's audit log plus each target's sshd logs (which record the cert serial on login) give you a full who/what/when/why.
 - **Test Deny, not just Approve.** It's the path most likely to sit unexercised — see the callout in Section 5. Fire a request, deny it deliberately, and confirm you see the signal you expect *before* you need Deny to matter for real.
 

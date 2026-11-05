@@ -1,1 +1,127 @@
-jit-request
+#!/usr/bin/env python3
+"""airlock-request — agent-side CLI to request just-in-time SSH access via Airlock.
+
+Runs on the agent host. Publishes a request to the ntfy `airlock-requests` topic
+and blocks until Airlock publishes the signed cert back on `airlock-certs` (or
+until timeout). The agent holds only publish creds to airlock-requests + read on
+airlock-certs; it cannot approve or sign.
+
+  usage: airlock-request <target> <duration> <reason> [approver]
+  e.g.:  airlock-request target-host-1 1h "restart the log-rotation service"
+         airlock-request transcribe 30m "restart whisper worker" teletraan
+
+On success the cert is written next to the agent key and its validity printed.
+See REPLICATION-GUIDE.md (Section 6) for wiring this into ~/.ssh/config.
+"""
+
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
+
+NTFY = "https://ntfy.example.net"
+TOPIC_REQ = "airlock-requests"
+TOPIC_CERT = "airlock-certs"
+TOKEN_FILE = Path.home() / ".config/airlock/ntfy-agent-token"
+KEY = Path.home() / ".ssh/airlock/agent_key"
+CERT = Path.home() / ".ssh/airlock/agent_key-cert.pub"
+TIMEOUT = 300  # seconds to wait for approval
+APPROVER_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def ensure_key():
+    KEY.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(KEY.parent, 0o700)
+    if not KEY.exists():
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                        "-C", "airlock-agent", "-f", str(KEY)], check=True)
+    return (KEY.with_suffix(".pub")).read_text().strip()
+
+
+def main():
+    if len(sys.argv) not in (4, 5):
+        die("usage: airlock-request <target> <duration> <reason> [approver]")
+    target, duration, reason = sys.argv[1], sys.argv[2], sys.argv[3]
+    approver = sys.argv[4].strip() if len(sys.argv) == 5 else None
+    if approver is not None and not APPROVER_NAME_RE.match(approver):
+        die(f"invalid approver name: {approver!r}")
+    if not TOKEN_FILE.exists():
+        die(f"missing agent ntfy token at {TOKEN_FILE}")
+    token = TOKEN_FILE.read_text().strip()
+    pubkey = ensure_key()
+    req_id = secrets.token_hex(8)
+
+    req_obj = {
+        "req_id": req_id,
+        "target": target,
+        "duration": duration,
+        "reason": reason,
+        "pubkey": pubkey,
+    }
+    if approver:
+        req_obj["approver"] = approver
+    request_json = json.dumps(req_obj)
+    payload = json.dumps({"topic": TOPIC_REQ, "message": request_json}).encode()
+    req = urlrequest.Request(
+        f"{NTFY}/", data=payload,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"}, method="POST")
+    try:
+        urlrequest.urlopen(req, timeout=15).read()
+    except (HTTPError, URLError) as e:
+        die(f"failed to publish request: {e}")
+    print(f"requested {target} for {duration} — waiting for approval "
+          f"(tap Approve on your phone, {TIMEOUT//60} min timeout)...")
+
+    deadline = time.time() + TIMEOUT
+    poll_url = f"{NTFY}/{TOPIC_CERT}/json?poll=1&since=2m"
+    while time.time() < deadline:
+        try:
+            preq = urlrequest.Request(
+                poll_url, headers={"Authorization": f"Bearer {token}"})
+            data = urlrequest.urlopen(preq, timeout=15).read().decode()
+        except (HTTPError, URLError, OSError):
+            time.sleep(2)
+            continue
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("event") != "message":
+                continue
+            try:
+                body = json.loads(ev.get("message", ""))
+            except json.JSONDecodeError:
+                continue
+            if body.get("req_id") != req_id or not body.get("cert"):
+                continue
+            CERT.write_text(body["cert"].strip() + "\n")
+            os.chmod(CERT, 0o644)
+            out = subprocess.run(["ssh-keygen", "-L", "-f", str(CERT)],
+                                 capture_output=True, text=True).stdout
+            valid = next((l.strip() for l in out.splitlines()
+                          if "Valid:" in l), "")
+            print(f"approved — cert written to {CERT}")
+            print(valid)
+            return
+        time.sleep(2)
+    die("approval timed out — no cert received", 2)
+
+
+if __name__ == "__main__":
+    main()

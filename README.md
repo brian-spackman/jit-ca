@@ -1,4 +1,4 @@
-# Homelab JIT-CA — just-in-time SSH for your AI agent
+# Homelab Airlock — just-in-time SSH for your AI agent
 
 > Give an AI agent the ability to work on your other machines **without** giving it standing keys to them. Default-deny everywhere; a single tap on your phone grants short-lived, scoped, auto-expiring access for one task. It's the just-in-time privileged-access pattern enterprise IAM tools (Azure PIM, AWS JIT access, CyberArk, etc.) use for humans, rebuilt for a self-hosted home lab out of `step-ca`, `ntfy`, and `ssh` certificates — a signing CA, not a directory-integrated identity platform.
 
@@ -6,7 +6,7 @@
 
 ## What's in this repo
 
-Three documents — this README, the [replication guide](./REPLICATION-GUIDE.md), and a [leaner standalone spec](./JIT-CA-SPEC.md) — covering the concept, the experience, and step-by-step build instructions in enough detail to implement your own instance from scratch. The [`scripts/`](./scripts/) directory contains sanitized reference implementations of the four core files: the approval daemon (`jit-ca-approver.py`), its systemd unit (`jit-ca-approver.service`), the agent-side request CLI (`jit-request`), and the CA host firewall script (`ufw-rules.sh`). Every deployment-specific value (IPs, hostnames, principal name, ntfy URL) is replaced with a clearly-marked placeholder comment; see the PLACEHOLDER lines near the top of each file.
+Three documents — this README, the [replication guide](./REPLICATION-GUIDE.md), and a [leaner standalone spec](./AIRLOCK-SPEC.md) — covering the concept, the experience, and step-by-step build instructions in enough detail to implement your own instance from scratch. The [`scripts/`](./scripts/) directory contains sanitized reference implementations of the four core files: the approval daemon (`airlock-approver.py`), its systemd unit (`airlock-approver.service`), the agent-side request CLI (`airlock-request`), and the CA host firewall script (`ufw-rules.sh`). Every deployment-specific value (IPs, hostnames, principal name, ntfy URL) is replaced with a clearly-marked placeholder comment; see the PLACEHOLDER lines near the top of each file.
 
 ## The problem
 
@@ -47,7 +47,7 @@ The crucial property: **compromising the agent is not enough to reach a target.*
    does the task, cert expires, access evaporates
 ```
 
-1. The agent runs `jit-request <host> <duration> "<reason>"`. This publishes a request and then blocks, waiting for a certificate.
+1. The agent runs `airlock-request <host> <duration> "<reason>"`. This publishes a request and then blocks, waiting for a certificate.
 2. An **approver daemon** on the CA box turns that into an actionable phone notification with a single-use, time-limited token behind the **Approve** button.
 3. You tap **Approve**. Your phone — and only your phone — sends the token to the approver.
 4. The approver verifies the token and asks `step-ca` to sign an SSH certificate for the agent's key, scoped to the principal/user you've mapped and capped at the requested TTL.
@@ -78,14 +78,14 @@ Honest gaps, not a roadmap fantasy — this is what a working v1 still lacks:
 - **Off-LAN approval is a bolt-on, not a default.** Approving from outside the LAN needs a reverse proxy + VPN path that most setups won't have configured out of the box.
 - **Cert expiry is silent.** The agent discovers an expired cert by having its SSH attempt fail — there's no proactive "your access just lapsed" signal.
 - **Untested paths hide bugs, even in a system that "works."** It's easy to build and repeatedly exercise the Approve path while Deny goes completely unexercised until it's needed for real — and a code path nobody has tapped is exactly where a logging gap or silent failure can hide. **Treat any control path you haven't personally tested end-to-end as unverified, not as working by inheritance from the paths you have tested.**
-- **The target allowlist is hardcoded in the approver script**, not externalized to a config file. `TARGET_ALLOWLIST` currently lives as a Python literal in `jit-ca-approver.py`. For a single-digit fleet that's fine, but it should really be a separate YAML (or similar) file the script reads at startup — easier to manage as the fleet grows, and it means changing the allowlist doesn't require touching code.
+- **The target allowlist is hardcoded in the approver script**, not externalized to a config file. `TARGET_ALLOWLIST` currently lives as a Python literal in `airlock-approver.py`. For a single-digit fleet that's fine, but it should really be a separate YAML (or similar) file the script reads at startup — easier to manage as the fleet grows, and it means changing the allowlist doesn't require touching code.
 - **The phone's ntfy subscription has read-write access, not read-only.** It wasn't obvious how to get a read-only subscription working in the ntfy app for the approvals topic, so the `phone` account was granted read-write for simplicity (Section 4.2/4.3 of the replication guide). That's a reasonable call for a homelab, but it's broader than the phone strictly needs — worth tightening if you're deploying this somewhere with a stricter threat model.
 - **Reference scripts and unit tests are in [`scripts/`](./scripts/) and [`tests/`](./tests/).** The real implementation, sanitized: approval daemon, systemd unit, agent CLI, firewall script, and a 22-test `unittest` suite (`python3 -m unittest discover -s tests -v`), with PLACEHOLDER comments marking values to fill in for your deployment.
 
 ## Read next
 
 - **[REPLICATION-GUIDE.md](./REPLICATION-GUIDE.md)** — the complete, reproducible build: the SSH CA, the approval daemon, the notification channel, the firewall posture, target onboarding, and a Known Gotchas section covering the failure modes most likely to bite you.
-- **[JIT-CA-SPEC.md](./JIT-CA-SPEC.md)** — a leaner, tool-agnostic version of the same build: one self-contained document (concept, UX, architecture, and step-by-step instructions) with the narrative detail stripped out, sized to hand to a coding agent as a build spec.
+- **[AIRLOCK-SPEC.md](./AIRLOCK-SPEC.md)** — a leaner, tool-agnostic version of the same build: one self-contained document (concept, UX, architecture, and step-by-step instructions) with the narrative detail stripped out, sized to hand to a coding agent as a build spec.
 
 ---
 

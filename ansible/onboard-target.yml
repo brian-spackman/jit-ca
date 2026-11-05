@@ -1,6 +1,6 @@
 ---
-- name: Onboard target hosts to JIT-CA (SSH User Certificate + Per-Target Principal)
-  hosts: jit_ca_targets
+- name: Onboard target hosts to Airlock (SSH User Certificate + Per-Target Principal)
+  hosts: airlock_targets
   become: true
   roles:
-    - role: jit_ca_target
+    - role: airlock_target

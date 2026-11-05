@@ -1,4 +1,4 @@
-# JIT-CA: Just-in-time SSH access for an AI agent
+# Airlock: Just-in-time SSH access for an AI agent
 
 A self-hosted pattern that lets an AI agent (or any semi-autonomous automation) reach other machines on a network **without ever holding a standing credential to them**. Access is granted per-task, expires on its own, and requires an explicit human approval — a tap on a phone — every single time. This document specifies the concept, the experience it produces, and enough implementation detail for a competent engineer or coding agent to build a working instance from scratch.
 
@@ -148,7 +148,7 @@ Wire the agent's SSH client configuration so that connecting to a target uses th
 Per target, one-time setup, additive and reversible (safe to do over an existing admin session):
 
 1. Create a dedicated service account for the agent's identity on that host — no password, no standing `authorized_keys` entries, only the group memberships/sudo rights it genuinely needs for its work there.
-2. Install the CA's user-certificate public key as a trusted issuer for SSH authentication on that host (`TrustedUserCAKeys`), and bind the target's service user to its per-target principal (`agent@<target>`) via `AuthorizedPrincipalsFile /etc/ssh/jit_ca_principals/%u` (`/etc/ssh/jit_ca_principals/agent`) so a certificate issued for Target A is rejected by Target B and cannot authenticate as `root`.
+2. Install the CA's user-certificate public key as a trusted issuer for SSH authentication on that host (`TrustedUserCAKeys`), and bind the target's service user to its per-target principal (`airlock-admin@<target>`) via `AuthorizedPrincipalsFile /etc/ssh/airlock_principals/%u` (`/etc/ssh/airlock_principals/agent`) so a certificate issued for Target A is rejected by Target B and cannot authenticate as `root`.
 3. Validate the sshd configuration syntactically **before** reloading it, and keep a fallback session open while you do — a bad config plus a reload is how you lock yourself out.
    - Be aware some systems run sshd as a socket-activated service, where configuration is read fresh on each new connection rather than requiring a reload/restart at all. Check which kind you have before assuming a reload is necessary or safe.
 4. Add the target to the approval daemon's allowlist and restart it.

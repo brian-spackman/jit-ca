@@ -1,16 +1,19 @@
 ---
 all:
   children:
-    jit_ca_targets:
+    airlock_targets:
       vars:
-        jit_ca_principal_user: "agent"
-        # Paste contents of /etc/jit-ca/certs/ssh_user_ca_key.pub from CA_HOST:
-        jit_ca_user_ca_pubkey: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABB... step-ca-user-ca"
-        jit_ca_manage_authorized_keys: false
-        jit_ca_hypervisor_guard_enabled: false
+        airlock_principal_user: "airlock-admin"
+        # Paste contents of /etc/airlock/certs/ssh_user_ca_key.pub from CA_HOST:
+        airlock_user_ca_pubkey: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABB... step-ca-user-ca"
+        airlock_manage_authorized_keys: false
+        airlock_hypervisor_guard_enabled: false
       hosts:
         target-host-1:
           ansible_host: 10.0.0.20
-          # Optional per-target human break-glass public key (private key kept in 1Password):
-          # jit_ca_manage_authorized_keys: true
-          # jit_ca_break_glass_pubkey: "ssh-ed25519 AAAA... target-host-1-break-glass"
+          # Optional list of approvers whose minted certs this host accepts (e.g. ["brian", "teletraan"]):
+          # airlock_allowed_approvers:
+          #   - "brian"
+          # Optional per-target human break-glass public key (private key escrowed in Bitwarden/1Password):
+          # airlock_manage_authorized_keys: true
+          # airlock_break_glass_pubkey: "ssh-ed25519 AAAA... target-host-1-break-glass"

@@ -1,0 +1,45 @@
+---
+# Default variables for airlock_target role
+# Override in host_vars, group_vars, or playbook vars.
+
+# Dedicated service account on the target host used by the agent with Airlock certs
+airlock_principal_user: "airlock-admin"
+airlock_principal_uid: null
+airlock_principal_shell: "/bin/bash"
+airlock_principal_groups:
+  - "sudo"
+airlock_sudo_nopasswd: true
+
+# Required: contents of step-ca's certs/ssh_user_ca_key.pub (single line)
+airlock_user_ca_pubkey: ""
+
+# Target hostname used in the per-target principal (<airlock_principal_user>@<airlock_target_name>).
+# Must match the target entry in airlock-approver's TARGET_ALLOWLIST.
+airlock_target_name: "{{ inventory_hostname }}"
+
+# Optional list of approver slugs (e.g. ["brian", "teletraan"]) whose approver-stamped
+# certificates (`approved-by-<approver>@<target>`) are accepted on this host.
+airlock_allowed_approvers: []
+airlock_include_generic_principal: true
+
+# OpenSSH CA trust & AuthorizedPrincipals paths
+airlock_trusted_ca_keys_path: "/etc/ssh/trusted_user_ca_keys"
+airlock_principals_dir: "/etc/ssh/airlock_principals"
+airlock_sshd_dropin_path: "/etc/ssh/sshd_config.d/10-airlock.conf"
+
+# Optional human-held break-glass SSH public key (Section 10 of REPLICATION-GUIDE.md).
+# When non-empty and airlock_manage_authorized_keys is true, writes ~/.ssh/authorized_keys
+# containing only airlock_break_glass_pubkey (+ any airlock_extra_authorized_keys),
+# retiring any build-time static agent keys or Day-0 birth keys.
+airlock_manage_authorized_keys: false
+airlock_break_glass_pubkey: ""
+airlock_extra_authorized_keys: []
+
+# Optional Proxmox hypervisor self-reference guard hookscript installation
+# (Disabled by default; enable only on Proxmox hypervisors that host the airlock VM).
+airlock_hypervisor_guard_enabled: false
+airlock_proxmox_snippets_dir: "/var/lib/vz/snippets"
+
+# Optional birth public key to scrub from /root/.ssh/authorized_keys at the end
+# of Day-0 enrollment (in case root was used as the bootstrap SSH user).
+airlock_purge_birth_pubkey: ""

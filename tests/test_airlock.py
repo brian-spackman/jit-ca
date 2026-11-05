@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Unit test suite for jit-ca (scripts/jit-ca-approver.py, scripts/jit-request, and configs).
+"""Unit test suite for airlock (scripts/airlock-approver.py, scripts/airlock-request, and configs).
 
 Covers:
   1. Existing baseline security and operational claims (allowlist, duration cap,
      pubkey check, single-use tokens, expiry, approve/deny flows, SIGN_FAIL,
      audit logging, webhook routing, and agent CLI polling/filtering/timeout).
-  2. New bugfixes & hardening from the 2026-11-01 peer review (JIT-01..JIT-05):
-     - JIT-01: Per-target certificate principal (`agent@<target>`) + audit + guide docs.
-     - JIT-02: `/deny` is silent on `jit-certs` (agent-visible silence).
-     - JIT-03: Input bounds/sanitization on `req_id`, `pubkey`, `reason`, and JSON types.
-     - JIT-04: `TOKEN_TTL` aligned with `jit-request` `TIMEOUT` (60s <= TOKEN_TTL <= 300s).
-     - JIT-05: `ufw-rules.sh` scoping, `LogsDirectory=jit-ca`, repo hygiene.
+  2. New bugfixes & hardening from the 2026-11-01 peer review (AIRLOCK-01..AIRLOCK-05):
+     - AIRLOCK-01: Per-target certificate principal (`agent@<target>`) + audit + guide docs.
+     - AIRLOCK-02: `/deny` is silent on `airlock-certs` (agent-visible silence).
+     - AIRLOCK-03: Input bounds/sanitization on `req_id`, `pubkey`, `reason`, and JSON types.
+     - AIRLOCK-04: `TOKEN_TTL` aligned with `airlock-request` `TIMEOUT` (60s <= TOKEN_TTL <= 300s).
+     - AIRLOCK-05: `ufw-rules.sh` scoping, `LogsDirectory=airlock`, repo hygiene.
 """
 
 import importlib.machinery
@@ -28,19 +28,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-REPO_ROOT = Path(os.environ.get("JIT_CA_REPO", Path(__file__).resolve().parent.parent))
-APPROVER_PATH = REPO_ROOT / "scripts" / "jit-ca-approver.py"
-REQUEST_CLI_PATH = REPO_ROOT / "scripts" / "jit-request"
+REPO_ROOT = Path(os.environ.get("AIRLOCK_REPO", Path(__file__).resolve().parent.parent))
+APPROVER_PATH = REPO_ROOT / "scripts" / "airlock-approver.py"
+REQUEST_CLI_PATH = REPO_ROOT / "scripts" / "airlock-request"
 UFW_SCRIPT_PATH = REPO_ROOT / "scripts" / "ufw-rules.sh"
-SERVICE_UNIT_PATH = REPO_ROOT / "scripts" / "jit-ca-approver.service"
+SERVICE_UNIT_PATH = REPO_ROOT / "scripts" / "airlock-approver.service"
 REP_GUIDE_PATH = REPO_ROOT / "REPLICATION-GUIDE.md"
 
-SAMPLE_PUBKEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDUMMYTESTKEY0000000000000000000000000000000 jit-ca-test"
+SAMPLE_PUBKEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDUMMYTESTKEY0000000000000000000000000000000 airlock-test"
 SAMPLE_REQ_ID = "a1b2c3d4e5f60718"
 
 
 def load_approver_module(token_file_path: str, audit_log_path: str):
-    """Load scripts/jit-ca-approver.py with mocked TOKEN_FILE and AUDIT_LOG paths."""
+    """Load scripts/airlock-approver.py with mocked TOKEN_FILE and AUDIT_LOG paths."""
     source = APPROVER_PATH.read_text()
     source, n1 = re.subn(
         r'^TOKEN_FILE\s*=.*$',
@@ -56,17 +56,17 @@ def load_approver_module(token_file_path: str, audit_log_path: str):
         count=1,
         flags=re.MULTILINE,
     )
-    assert n1 == 1 and n2 == 1, "Failed to patch TOKEN_FILE or AUDIT_LOG in jit-ca-approver.py"
-    spec = importlib.util.spec_from_loader("jit_ca_approver", loader=None)
+    assert n1 == 1 and n2 == 1, "Failed to patch TOKEN_FILE or AUDIT_LOG in airlock-approver.py"
+    spec = importlib.util.spec_from_loader("airlock_approver", loader=None)
     mod = importlib.util.module_from_spec(spec)
     exec(compile(source, str(APPROVER_PATH), "exec"), mod.__dict__)
     return mod
 
 
 def load_request_module():
-    """Load scripts/jit-request as a module without executing main()."""
-    loader = importlib.machinery.SourceFileLoader("jit_request", str(REQUEST_CLI_PATH))
-    spec = importlib.util.spec_from_loader("jit_request", loader)
+    """Load scripts/airlock-request as a module without executing main()."""
+    loader = importlib.machinery.SourceFileLoader("airlock_request", str(REQUEST_CLI_PATH))
+    spec = importlib.util.spec_from_loader("airlock_request", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
@@ -100,7 +100,7 @@ class FakeWebhookRequest:
 
 
 class TestBaselineApproverClaims(unittest.TestCase):
-    """Tests for capabilities already claimed by jit-ca v1."""
+    """Tests for capabilities already claimed by airlock v1."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -391,9 +391,9 @@ class TestBaselineApproverClaims(unittest.TestCase):
 
 
 class TestBaselineAgentCli(unittest.TestCase):
-    """Tests for scripts/jit-request agent-side CLI."""
+    """Tests for scripts/airlock-request agent-side CLI."""
 
-    def test_jit_request_filters_by_req_id_and_writes_cert(self):
+    def test_airlock_request_filters_by_req_id_and_writes_cert(self):
         req_mod = load_request_module()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -420,14 +420,14 @@ class TestBaselineAgentCli(unittest.TestCase):
             with mock.patch.object(req_mod.secrets, "token_hex", return_value=fixed_req_id), \
                  mock.patch.object(req_mod.urlrequest, "urlopen", side_effect=fake_urlopen), \
                  mock.patch.object(req_mod.subprocess, "run") as mock_run, \
-                 mock.patch.object(sys, "argv", ["jit-request", "target-host-1", "1h", "test reason"]):
+                 mock.patch.object(sys, "argv", ["airlock-request", "target-host-1", "1h", "test reason"]):
                 mock_run.return_value = mock.Mock(stdout="        Valid: from 2026-11-02T09:00:00 to 2026-11-02T10:00:00\n")
                 req_mod.main()
 
             self.assertTrue(req_mod.CERT.exists())
             self.assertEqual(req_mod.CERT.read_text().strip(), "VALID-CERT-DATA")
 
-    def test_jit_request_times_out_with_exit_code_2(self):
+    def test_airlock_request_times_out_with_exit_code_2(self):
         req_mod = load_request_module()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -444,14 +444,14 @@ class TestBaselineAgentCli(unittest.TestCase):
                 return io.BytesIO(b"")
 
             with mock.patch.object(req_mod.urlrequest, "urlopen", side_effect=fake_urlopen), \
-                 mock.patch.object(sys, "argv", ["jit-request", "target-host-1", "1h", "timeout test"]):
+                 mock.patch.object(sys, "argv", ["airlock-request", "target-host-1", "1h", "timeout test"]):
                 with self.assertRaises(SystemExit) as ctx:
                     req_mod.main()
                 self.assertEqual(ctx.exception.code, 2)
 
 
 class TestNewReviewFixes(unittest.TestCase):
-    """Tests for JIT-01 through JIT-05 surfaced by the 2026-11-01 peer review."""
+    """Tests for AIRLOCK-01 through AIRLOCK-05 surfaced by the 2026-11-01 peer review."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -480,8 +480,8 @@ class TestNewReviewFixes(unittest.TestCase):
         req = FakeWebhookRequest(self.approver.Handler, path, body)
         return req.run()
 
-    def test_jit01_sign_cert_scopes_principal_per_target(self):
-        """JIT-01: Each target gets a distinct '<PRINCIPAL>@<target>' in --principal, positional key ID, and audit log."""
+    def test_airlock01_sign_cert_scopes_principal_per_target(self):
+        """AIRLOCK-01: Each target gets a distinct '<PRINCIPAL>@<target>' in --principal, positional key ID, and audit log."""
         self.approver.TARGET_ALLOWLIST = {"target-host-1", "target-host-2"}
         captured_step_cmds = []
 
@@ -527,16 +527,16 @@ class TestNewReviewFixes(unittest.TestCase):
 
         audit_text = Path(self.audit_file).read_text()
         logged_principals = re.findall(r"\bprincipal=(\S+)", audit_text)
-        self.assertIn(f"{self.approver.PRINCIPAL}@target-host-1", logged_principals)
+        self.assertIn("airlock-admin@target-host-1", logged_principals)
         self.assertIn(f"{self.approver.PRINCIPAL}@target-host-2", logged_principals)
 
         # Ensure REPLICATION-GUIDE.md documents AuthorizedPrincipalsFile with per-target principal
         guide_text = REP_GUIDE_PATH.read_text()
-        self.assertRegex(guide_text, r"AuthorizedPrincipalsFile\s+/etc/ssh/jit_ca_principals/%u")
+        self.assertRegex(guide_text, r"AuthorizedPrincipalsFile\s+/etc/ssh/airlock_principals/%u")
         self.assertIn("agent@", guide_text)
 
-    def test_jit02_deny_is_silent_on_cert_topic(self):
-        """JIT-02: /deny must NOT publish to TOPIC_CERT so Deny is indistinguishable from silence to the agent."""
+    def test_airlock02_deny_is_silent_on_cert_topic(self):
+        """AIRLOCK-02: /deny must NOT publish to TOPIC_CERT so Deny is indistinguishable from silence to the agent."""
         payload = json.dumps({
             "req_id": SAMPLE_REQ_ID,
             "target": "target-host-1",
@@ -566,8 +566,8 @@ class TestNewReviewFixes(unittest.TestCase):
             f"Expected 0 messages on {self.approver.TOPIC_CERT} upon /deny, got {cert_topic_msgs}",
         )
 
-    def test_jit03_rejects_missing_or_malformed_req_id_and_bad_json_types(self):
-        """JIT-03a: Missing, non-hex, or injected req_id and non-dict JSON must be rejected cleanly."""
+    def test_airlock03_rejects_missing_or_malformed_req_id_and_bad_json_types(self):
+        """AIRLOCK-03a: Missing, non-hex, or injected req_id and non-dict JSON must be rejected cleanly."""
         for non_dict in ("[]", "null", "123", '"just-a-string"'):
             with self.subTest(non_dict=non_dict):
                 self.approver.handle_request(non_dict)
@@ -619,8 +619,8 @@ class TestNewReviewFixes(unittest.TestCase):
         }))
         self.assertEqual(len(self.approver._pending), 1)
 
-    def test_jit03_rejects_oversized_or_multiline_pubkey(self):
-        """JIT-03b: Oversized (>2048B) or multiline/control-char pubkeys must be rejected."""
+    def test_airlock03_rejects_oversized_or_multiline_pubkey(self):
+        """AIRLOCK-03b: Oversized (>2048B) or multiline/control-char pubkeys must be rejected."""
         bad_keys = [
             "ssh-ed25519 " + ("A" * 3000),
             SAMPLE_PUBKEY + "\nssh-ed25519 AAAA_injected",
@@ -639,8 +639,8 @@ class TestNewReviewFixes(unittest.TestCase):
                 }))
                 self.assertEqual(len(self.approver._pending), 0)
 
-    def test_jit03_sanitizes_spoofed_and_overlong_reason(self):
-        """JIT-03c: Reason with newlines/control chars or >200 chars must be queued with a sanitized reason in record, notification, and audit log."""
+    def test_airlock03_sanitizes_spoofed_and_overlong_reason(self):
+        """AIRLOCK-03c: Reason with newlines/control chars or >200 chars must be queued with a sanitized reason in record, notification, and audit log."""
         spoofed_reason = "harmless check\n\r\x00\x1b\u2028\u202eAPPROVED: root@production " + ("x" * 250)
         self.approver.handle_request(json.dumps({
             "req_id": SAMPLE_REQ_ID,
@@ -668,8 +668,8 @@ class TestNewReviewFixes(unittest.TestCase):
         self.assertEqual(len(audit_lines), 1)
         self.assertNotIn("\\n", audit_lines[0], "Sanitized reason in audit log should not contain embedded newline")
 
-    def test_jit04_token_ttl_matches_cli_timeout(self):
-        """JIT-04: TOKEN_TTL must be between 60s and jit-request TIMEOUT (300s)."""
+    def test_airlock04_token_ttl_matches_cli_timeout(self):
+        """AIRLOCK-04: TOKEN_TTL must be between 60s and airlock-request TIMEOUT (300s)."""
         req_mod = load_request_module()
         self.assertGreaterEqual(self.approver.TOKEN_TTL, 60)
         self.assertLessEqual(
@@ -678,21 +678,21 @@ class TestNewReviewFixes(unittest.TestCase):
             f"TOKEN_TTL ({self.approver.TOKEN_TTL}s) exceeds CLI TIMEOUT ({req_mod.TIMEOUT}s)",
         )
 
-    def test_jit05_ufw_systemd_and_repo_hygiene(self):
-        """JIT-05: ufw-rules.sh scopes SSH + VPN 8080, service sets LogsDirectory=jit-ca, no verdict artifact."""
+    def test_airlock05_ufw_systemd_and_repo_hygiene(self):
+        """AIRLOCK-05: ufw-rules.sh scopes SSH + VPN 8080, service sets LogsDirectory=airlock, no verdict artifact."""
         ufw_text = UFW_SCRIPT_PATH.read_text()
         self.assertNotIn("ufw allow 22/tcp", ufw_text, "SSH on CA host should be subnet-scoped, not open to any")
         self.assertRegex(ufw_text, r'ufw allow from "\$LAN_SUBNET" to any port 22')
         self.assertRegex(ufw_text, r'ufw allow from "\$VPN_SUBNET" to any port 8080')
 
         service_text = SERVICE_UNIT_PATH.read_text()
-        self.assertIn("LogsDirectory=jit-ca", service_text)
+        self.assertIn("LogsDirectory=airlock", service_text)
 
         verdict_file = REPO_ROOT / ".adjudication-verdict.json"
         self.assertFalse(verdict_file.exists(), ".adjudication-verdict.json should be removed from repo root")
 
-    def test_jit06_hypervisor_guard_is_noop_by_default(self):
-        """JIT-06a: When CURRENT_HOST_FILE does not exist, current_hypervisor() is None and normal requests work unchanged."""
+    def test_airlock06_hypervisor_guard_is_noop_by_default(self):
+        """AIRLOCK-06a: When CURRENT_HOST_FILE does not exist, current_hypervisor() is None and normal requests work unchanged."""
         self.approver.CURRENT_HOST_FILE = os.path.join(self.tmpdir.name, "nonexistent-current-hypervisor")
         self.assertIsNone(self.approver.current_hypervisor())
 
@@ -707,8 +707,8 @@ class TestNewReviewFixes(unittest.TestCase):
         self.assertEqual(len(self.approver._pending), 1)
         self.assertEqual(self.published[0]["actions"][0]["label"], "Approve")
 
-    def test_jit06_hypervisor_guard_rejects_self_target_when_no_evacuate_helper(self):
-        """JIT-06b: If target == current_hypervisor and no evacuate helper exists, request and approve both fail closed."""
+    def test_airlock06_hypervisor_guard_rejects_self_target_when_no_evacuate_helper(self):
+        """AIRLOCK-06b: If target == current_hypervisor and no evacuate helper exists, request and approve both fail closed."""
         host_file = Path(self.tmpdir.name) / "current-hypervisor"
         host_file.write_text("target-host-1\n")
         self.approver.CURRENT_HOST_FILE = str(host_file)
@@ -738,8 +738,8 @@ class TestNewReviewFixes(unittest.TestCase):
         self.assertEqual(code, 409)
         self.assertIn("SIGN_BLOCKED_SELF_HOST", Path(self.audit_file).read_text())
 
-    def test_jit06_hypervisor_guard_evacuates_then_signs_and_fails_closed_if_stuck(self):
-        """JIT-06c: With EVACUATE_CMD present, Approve evacuates first and only signs once current_hypervisor != target."""
+    def test_airlock06_hypervisor_guard_evacuates_then_signs_and_fails_closed_if_stuck(self):
+        """AIRLOCK-06c: With EVACUATE_CMD present, Approve evacuates first and only signs once current_hypervisor != target."""
         host_file = Path(self.tmpdir.name) / "current-hypervisor"
         host_file.write_text("target-host-1\n")
         evac_script = Path(self.tmpdir.name) / "mock-evacuate.sh"
@@ -797,24 +797,24 @@ class TestNewReviewFixes(unittest.TestCase):
         self.assertEqual(code2, 409)
         self.assertIn("EVACUATE_FAIL", Path(self.audit_file).read_text())
 
-    def test_jit07_ansible_target_role_and_contrib_guard_structure(self):
-        """JIT-07: Ansible target onboarding role and optional contrib hypervisor guard files exist and default to guard disabled."""
-        defaults_yml = (REPO_ROOT / "ansible" / "roles" / "jit_ca_target" / "defaults" / "main.yml").read_text()
-        tasks_yml = (REPO_ROOT / "ansible" / "roles" / "jit_ca_target" / "tasks" / "main.yml").read_text()
-        handlers_yml = (REPO_ROOT / "ansible" / "roles" / "jit_ca_target" / "handlers" / "main.yml").read_text()
+    def test_airlock07_ansible_target_role_and_contrib_guard_structure(self):
+        """AIRLOCK-07: Ansible target onboarding role and optional contrib hypervisor guard files exist and default to guard disabled."""
+        defaults_yml = (REPO_ROOT / "ansible" / "roles" / "airlock_target" / "defaults" / "main.yml").read_text()
+        tasks_yml = (REPO_ROOT / "ansible" / "roles" / "airlock_target" / "tasks" / "main.yml").read_text()
+        handlers_yml = (REPO_ROOT / "ansible" / "roles" / "airlock_target" / "handlers" / "main.yml").read_text()
 
-        self.assertIn("jit_ca_hypervisor_guard_enabled: false", defaults_yml)
-        self.assertIn("AuthorizedPrincipalsFile {{ jit_ca_principals_dir }}/%u", tasks_yml)
+        self.assertIn("airlock_hypervisor_guard_enabled: false", defaults_yml)
+        self.assertIn("AuthorizedPrincipalsFile {{ airlock_principals_dir }}/%u", tasks_yml)
         self.assertIn("ssh.socket", handlers_yml)
 
-        for script_name in ("inject-host-identity.sh", "jit-ca-set-host", "jit-ca-evacuate"):
+        for script_name in ("inject-host-identity.sh", "airlock-set-host", "airlock-evacuate"):
             p = REPO_ROOT / "contrib" / "proxmox-hypervisor-guard" / script_name
             self.assertTrue(p.is_file(), f"Missing {p}")
             self.assertTrue(os.access(p, os.X_OK), f"{p} is not executable")
 
 
-    def test_jit08_enroll_request_validation_and_approval_flow(self):
-        """JIT-08a: Day-0 enroll validates hostname/private IP, escrows break-glass key, runs playbook, and updates allowlist."""
+    def test_airlock08_enroll_request_validation_and_approval_flow(self):
+        """AIRLOCK-08a: Day-0 enroll validates hostname/private IP, escrows break-glass key, runs playbook, and updates allowlist."""
         # 1. Invalid hostname and non-private IPs must be rejected
         for bad_target, bad_ip in [
             ("bad host!", "10.6.31.1"),
@@ -840,7 +840,7 @@ class TestNewReviewFixes(unittest.TestCase):
         birth_pub = Path(self.tmpdir.name) / "birth_key.pub"
         birth_pub.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBirthKeyTest airlock-birth-key\n")
         playbook = Path(self.tmpdir.name) / "onboard-target.yml"
-        playbook.write_text("---\n- hosts: jit_ca_targets\n")
+        playbook.write_text("---\n- hosts: airlock_targets\n")
         escrow_dir = Path(self.tmpdir.name) / "escrow"
         allowlist_file = Path(self.tmpdir.name) / "target-allowlist"
 
@@ -890,26 +890,26 @@ class TestNewReviewFixes(unittest.TestCase):
         self.assertEqual(escrowed_priv.stat().st_mode & 0o777, 0o600)
 
         # Verify inventory passed to ansible-playbook had birth key + break-glass pubkey + purge_birth_pubkey
-        host_vars = captured_inventory["all"]["children"]["jit_ca_targets"]["hosts"]["transcribe"]
+        host_vars = captured_inventory["all"]["children"]["airlock_targets"]["hosts"]["transcribe"]
         self.assertEqual(host_vars["ansible_host"], "10.6.31.1")
         self.assertEqual(host_vars["ansible_ssh_private_key_file"], str(birth_key))
-        self.assertTrue(host_vars["jit_ca_manage_authorized_keys"])
-        self.assertEqual(host_vars["jit_ca_break_glass_pubkey"], escrowed_pub.read_text().strip())
-        self.assertIn("airlock-birth-key", host_vars["jit_ca_purge_birth_pubkey"])
+        self.assertTrue(host_vars["airlock_manage_authorized_keys"])
+        self.assertEqual(host_vars["airlock_break_glass_pubkey"], escrowed_pub.read_text().strip())
+        self.assertIn("airlock-birth-key", host_vars["airlock_purge_birth_pubkey"])
 
         # Verify allowlist updated in memory and on disk
         self.assertTrue(self.approver.is_target_allowlisted("transcribe"))
         self.assertIn("transcribe", allowlist_file.read_text().splitlines())
         self.assertIn("ENROLL", Path(self.audit_file).read_text())
 
-    def test_jit08_enroll_fails_closed_if_playbook_fails(self):
-        """JIT-08b: If ansible-playbook fails during enrollment, target is NOT added to TARGET_ALLOWLIST."""
+    def test_airlock08_enroll_fails_closed_if_playbook_fails(self):
+        """AIRLOCK-08b: If ansible-playbook fails during enrollment, target is NOT added to TARGET_ALLOWLIST."""
         ca_pub = Path(self.tmpdir.name) / "user_ca.pub"
         ca_pub.write_text(SAMPLE_PUBKEY + "\n")
         birth_key = Path(self.tmpdir.name) / "birth_key"
         birth_key.write_text("PRIVATE_BIRTH_KEY\n")
         playbook = Path(self.tmpdir.name) / "onboard-target.yml"
-        playbook.write_text("---\n- hosts: jit_ca_targets\n")
+        playbook.write_text("---\n- hosts: airlock_targets\n")
         escrow_dir = Path(self.tmpdir.name) / "escrow"
 
         self.approver.USER_CA_PUBKEY_FILE = str(ca_pub)
@@ -942,12 +942,84 @@ class TestNewReviewFixes(unittest.TestCase):
         self.assertFalse(self.approver.is_target_allowlisted("new-lxc"))
         self.assertIn("ENROLL_FAIL", Path(self.audit_file).read_text())
 
-    def test_jit08_airlock_cli_and_symlinks(self):
-        """JIT-08c: jit-enroll and airlock-* symlinks exist and are executable."""
-        for script_name in ("jit-enroll", "airlock-enroll", "airlock-request", "airlock-approver.py"):
+    def test_airlock08_airlock_cli_and_symlinks(self):
+        """AIRLOCK-08c: airlock-enroll and airlock-* symlinks exist and are executable."""
+        for script_name in ("airlock-enroll", "airlock-request", "airlock-approver.py", "ufw-rules.sh"):
             p = REPO_ROOT / "scripts" / script_name
             self.assertTrue(p.exists(), f"Missing {p}")
             self.assertTrue(os.access(p, os.X_OK), f"{p} is not executable")
+
+
+    def test_airlock09_multi_approver_routing_principal_stamping_and_opa_silent_precheck(self):
+        """AIRLOCK-09: Supports per-approver ntfy topics, approved-by-<approver>@<target> principal stamping, and silent_precheck OPA mode (zero permission oracle)."""
+        self.approver.PER_APPROVER_TOPICS = True
+        self.approver.STAMP_APPROVER_PRINCIPAL = True
+
+        # 1. Request specifying approver='teletraan' routes to 'airlock-approvals-teletraan'
+        req_payload = json.dumps({
+            "req_id": SAMPLE_REQ_ID,
+            "target": "target-host-1",
+            "duration": "30m",
+            "reason": "restart container",
+            "pubkey": SAMPLE_PUBKEY,
+            "approver": "teletraan",
+        })
+        self.approver.handle_request(req_payload)
+        self.assertEqual(len(self.approver._pending), 1)
+        self.assertEqual(self.published[-1]["topic"], "airlock-approvals-teletraan")
+        token = next(iter(self.approver._pending.keys()))
+
+        captured_step_cmd = []
+
+        def fake_sign_run(cmd, *a, **kw):
+            if cmd[:3] == ["step", "ssh", "certificate"]:
+                captured_step_cmd.extend(cmd)
+                certfile = cmd[cmd.index("--force") - 1].replace("k.pub", "k-cert.pub")
+                Path(certfile).write_text("ssh-ed25519-cert-v01@openssh.com AAAA_TELETRAAN_CERT")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if cmd[0] == "ssh-keygen":
+                return subprocess.CompletedProcess(cmd, 0, stdout="        Valid: from now to later\n", stderr="")
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        with mock.patch.object(self.approver.subprocess, "run", side_effect=fake_sign_run):
+            code, body = self._invoke_post("/approve", token)
+
+        self.assertEqual(code, 200)
+        self.assertEqual(body, "approved")
+        self.assertIn("approved-by-teletraan@target-host-1", captured_step_cmd)
+        cert_msgs = [m for m in self.published if m["topic"] == self.approver.TOPIC_CERT]
+        self.assertEqual(len(cert_msgs), 1)
+        self.assertEqual(json.loads(cert_msgs[0]["message"])["approver"], "teletraan")
+        self.assertIn("approver=teletraan", Path(self.audit_file).read_text())
+
+        # 2. Enable PRECHECK_MODE = 'silent_precheck'; when OPA denies, approver is NOT paged and TOPIC_CERT receives NOTHING (zero permission oracle!)
+        self.published.clear()
+        self.approver.PRECHECK_MODE = "silent_precheck"
+        self.approver.OPA_PRECHECK_URL = "http://127.0.0.1:8181/v1/data/airlock/allow"
+
+        class FakeOpaResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+            def read(self):
+                return b'{"result": false}'
+
+        with mock.patch.object(self.approver.urlrequest, "urlopen", return_value=FakeOpaResp()):
+            self.approver.handle_request(json.dumps({
+                "req_id": SAMPLE_REQ_ID,
+                "target": "target-host-1",
+                "duration": "30m",
+                "reason": "unauthorized approver probe",
+                "pubkey": SAMPLE_PUBKEY,
+                "approver": "derpy",
+            }))
+
+        # Pending queue must be empty, derpy's channel was NOT paged, and TOPIC_CERT is silent
+        self.assertEqual(len(self.approver._pending), 0)
+        self.assertEqual([m for m in self.published if m["topic"] == "airlock-approvals-derpy"], [])
+        self.assertEqual([m for m in self.published if m["topic"] == self.approver.TOPIC_CERT], [])
+        self.assertIn("PRECHECK_DENIED", Path(self.audit_file).read_text())
 
 
 if __name__ == "__main__":

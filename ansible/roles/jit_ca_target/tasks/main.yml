@@ -1,0 +1,124 @@
+---
+- name: Validate jit_ca_user_ca_pubkey is provided
+  ansible.builtin.assert:
+    that:
+      - jit_ca_user_ca_pubkey is string
+      - jit_ca_user_ca_pubkey | trim | length > 20
+      - (jit_ca_user_ca_pubkey | trim).startswith(('ecdsa-', 'ssh-ed25519', 'ssh-rsa', 'sk-'))
+    fail_msg: "jit_ca_user_ca_pubkey must be set to the contents of certs/ssh_user_ca_key.pub from CA_HOST."
+
+- name: Ensure principal group exists when explicit UID/GID is requested
+  ansible.builtin.group:
+    name: "{{ jit_ca_principal_user }}"
+    gid: "{{ jit_ca_principal_uid }}"
+    state: present
+  when: jit_ca_principal_uid is not none
+
+- name: Ensure JIT-CA principal user exists with locked password
+  ansible.builtin.user:
+    name: "{{ jit_ca_principal_user }}"
+    uid: "{{ jit_ca_principal_uid if jit_ca_principal_uid is not none else omit }}"
+    group: "{{ jit_ca_principal_user if jit_ca_principal_uid is not none else omit }}"
+    groups: "{{ jit_ca_principal_groups }}"
+    append: true
+    shell: "{{ jit_ca_principal_shell }}"
+    create_home: true
+    password_lock: true
+    state: present
+
+- name: Configure passwordless sudo for JIT-CA principal user
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ jit_ca_principal_user }}"
+    content: "{{ jit_ca_principal_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "/usr/sbin/visudo -cf %s"
+  when: jit_ca_sudo_nopasswd | bool
+
+- name: Install trusted SSH User CA public key
+  ansible.builtin.copy:
+    dest: "{{ jit_ca_trusted_ca_keys_path }}"
+    content: "{{ (jit_ca_user_ca_pubkey | trim) ~ '\n' }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sshd safely
+
+- name: Create AuthorizedPrincipals directory
+  ansible.builtin.file:
+    path: "{{ jit_ca_principals_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure per-target principal binding ({{ jit_ca_principal_user }}@{{ jit_ca_target_name }})
+  ansible.builtin.copy:
+    dest: "{{ jit_ca_principals_dir }}/{{ jit_ca_principal_user }}"
+    content: "{{ jit_ca_principal_user }}@{{ jit_ca_target_name }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure sshd drop-in for JIT-CA user certificates and principals
+  ansible.builtin.copy:
+    dest: "{{ jit_ca_sshd_dropin_path }}"
+    content: |
+      TrustedUserCAKeys {{ jit_ca_trusted_ca_keys_path }}
+      AuthorizedPrincipalsFile {{ jit_ca_principals_dir }}/%u
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sshd safely
+
+- name: Validate sshd configuration syntax
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: false
+  check_mode: false
+
+- name: Ensure ~/.ssh directory exists for principal user
+  ansible.builtin.file:
+    path: "/home/{{ jit_ca_principal_user }}/.ssh"
+    state: directory
+    owner: "{{ jit_ca_principal_user }}"
+    group: "{{ jit_ca_principal_user }}"
+    mode: "0700"
+  when: jit_ca_manage_authorized_keys | bool
+
+- name: Configure ~/.ssh/authorized_keys (break-glass key + any explicit extra keys only)
+  ansible.builtin.copy:
+    dest: "/home/{{ jit_ca_principal_user }}/.ssh/authorized_keys"
+    content: |
+      {% if jit_ca_break_glass_pubkey is string and (jit_ca_break_glass_pubkey | trim | length > 0) %}
+      {{ jit_ca_break_glass_pubkey | trim }}
+      {% endif %}
+      {% if jit_ca_extra_authorized_keys is sequence and jit_ca_extra_authorized_keys is not string %}
+      {% for key in jit_ca_extra_authorized_keys if (key is string and (key | trim | length > 0)) %}
+      {{ key | trim }}
+      {% endfor %}
+      {% endif %}
+    owner: "{{ jit_ca_principal_user }}"
+    group: "{{ jit_ca_principal_user }}"
+    mode: "0600"
+    backup: true
+  when: jit_ca_manage_authorized_keys | bool
+
+- name: Install optional Proxmox hypervisor host-identity hookscript (when enabled)
+  block:
+    - name: Ensure Proxmox snippets directory exists
+      ansible.builtin.file:
+        path: "{{ jit_ca_proxmox_snippets_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install inject-host-identity.sh Proxmox hookscript
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../contrib/proxmox-hypervisor-guard/inject-host-identity.sh"
+        dest: "{{ jit_ca_proxmox_snippets_dir }}/inject-host-identity.sh"
+        owner: root
+        group: root
+        mode: "0755"
+  when: jit_ca_hypervisor_guard_enabled | bool

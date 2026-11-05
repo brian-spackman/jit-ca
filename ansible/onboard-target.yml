@@ -1,0 +1,6 @@
+---
+- name: Onboard target hosts to JIT-CA (SSH User Certificate + Per-Target Principal)
+  hosts: jit_ca_targets
+  become: true
+  roles:
+    - role: jit_ca_target

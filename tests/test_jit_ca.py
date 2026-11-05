@@ -691,6 +691,127 @@ class TestNewReviewFixes(unittest.TestCase):
         verdict_file = REPO_ROOT / ".adjudication-verdict.json"
         self.assertFalse(verdict_file.exists(), ".adjudication-verdict.json should be removed from repo root")
 
+    def test_jit06_hypervisor_guard_is_noop_by_default(self):
+        """JIT-06a: When CURRENT_HOST_FILE does not exist, current_hypervisor() is None and normal requests work unchanged."""
+        self.approver.CURRENT_HOST_FILE = os.path.join(self.tmpdir.name, "nonexistent-current-hypervisor")
+        self.assertIsNone(self.approver.current_hypervisor())
+
+        payload = json.dumps({
+            "req_id": SAMPLE_REQ_ID,
+            "target": "target-host-1",
+            "duration": "1h",
+            "reason": "default noop check",
+            "pubkey": SAMPLE_PUBKEY,
+        })
+        self.approver.handle_request(payload)
+        self.assertEqual(len(self.approver._pending), 1)
+        self.assertEqual(self.published[0]["actions"][0]["label"], "Approve")
+
+    def test_jit06_hypervisor_guard_rejects_self_target_when_no_evacuate_helper(self):
+        """JIT-06b: If target == current_hypervisor and no evacuate helper exists, request and approve both fail closed."""
+        host_file = Path(self.tmpdir.name) / "current-hypervisor"
+        host_file.write_text("target-host-1\n")
+        self.approver.CURRENT_HOST_FILE = str(host_file)
+        self.approver.EVACUATE_CMD = os.path.join(self.tmpdir.name, "no-such-evacuate")
+
+        payload = json.dumps({
+            "req_id": SAMPLE_REQ_ID,
+            "target": "target-host-1",
+            "duration": "1h",
+            "reason": "attempt self mutation",
+            "pubkey": SAMPLE_PUBKEY,
+        })
+        self.approver.handle_request(payload)
+        self.assertEqual(len(self.approver._pending), 0, "Self-target without evacuate helper must be rejected at request time")
+        audit_text = Path(self.audit_file).read_text()
+        self.assertIn("REJECT_SELF_HOST", audit_text)
+
+        # Even if a token were queued while on peer host and the VM migrated onto target-host-1 before /approve:
+        host_file.write_text("target-host-2\n")
+        self.approver.handle_request(payload)
+        self.assertEqual(len(self.approver._pending), 1)
+        token = next(iter(self.approver._pending.keys()))
+
+        # Now VM is on target-host-1 when /approve is tapped:
+        host_file.write_text("target-host-1\n")
+        code, body = self._invoke_post("/approve", token)
+        self.assertEqual(code, 409)
+        self.assertIn("SIGN_BLOCKED_SELF_HOST", Path(self.audit_file).read_text())
+
+    def test_jit06_hypervisor_guard_evacuates_then_signs_and_fails_closed_if_stuck(self):
+        """JIT-06c: With EVACUATE_CMD present, Approve evacuates first and only signs once current_hypervisor != target."""
+        host_file = Path(self.tmpdir.name) / "current-hypervisor"
+        host_file.write_text("target-host-1\n")
+        evac_script = Path(self.tmpdir.name) / "mock-evacuate.sh"
+        evac_script.write_text("#!/bin/sh\nexit 0\n")
+        evac_script.chmod(0o755)
+
+        self.approver.CURRENT_HOST_FILE = str(host_file)
+        self.approver.EVACUATE_CMD = str(evac_script)
+
+        payload = json.dumps({
+            "req_id": SAMPLE_REQ_ID,
+            "target": "target-host-1",
+            "duration": "1h",
+            "reason": "hypervisor kernel upgrade",
+            "pubkey": SAMPLE_PUBKEY,
+        })
+        self.approver.handle_request(payload)
+        self.assertEqual(len(self.approver._pending), 1)
+        self.assertEqual(self.published[-1]["actions"][0]["label"], "Approve: Evacuate & Mint")
+        token = next(iter(self.approver._pending.keys()))
+
+        # Case 1: Evacuation runs and updates current-hypervisor to target-host-2
+        def fake_run(cmd, *a, **kw):
+            if cmd[0] == str(evac_script):
+                host_file.write_text("target-host-2\n")
+                return subprocess.CompletedProcess(cmd, 0, stdout="migrated", stderr="")
+            if cmd[:3] == ["step", "ssh", "certificate"]:
+                certfile = cmd[cmd.index("--force") - 1].replace("k.pub", "k-cert.pub")
+                Path(certfile).write_text("ssh-ed25519-cert-v01@openssh.com AAAA_EVAC_CERT")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if cmd[0] == "ssh-keygen":
+                return subprocess.CompletedProcess(cmd, 0, stdout="        Valid: from now to later\n", stderr="")
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        with mock.patch.object(self.approver.subprocess, "run", side_effect=fake_run):
+            code, body = self._invoke_post("/approve", token)
+        self.assertEqual(code, 200)
+        self.assertEqual(body, "approved")
+        audit_text = Path(self.audit_file).read_text()
+        self.assertIn("EVACUATE", audit_text)
+        self.assertIn("SIGN", audit_text)
+
+        # Case 2: Evacuation script returns 0 but fails to move off target-host-1 -> must fail closed (409)
+        host_file.write_text("target-host-1\n")
+        self.approver.handle_request(payload)
+        token2 = next(iter(self.approver._pending.keys()))
+
+        def stuck_run(cmd, *a, **kw):
+            if cmd[0] == str(evac_script):
+                return subprocess.CompletedProcess(cmd, 0, stdout="noop", stderr="")
+            raise AssertionError("sign_cert must NOT be called when still on target hypervisor")
+
+        with mock.patch.object(self.approver.subprocess, "run", side_effect=stuck_run):
+            code2, body2 = self._invoke_post("/approve", token2)
+        self.assertEqual(code2, 409)
+        self.assertIn("EVACUATE_FAIL", Path(self.audit_file).read_text())
+
+    def test_jit07_ansible_target_role_and_contrib_guard_structure(self):
+        """JIT-07: Ansible target onboarding role and optional contrib hypervisor guard files exist and default to guard disabled."""
+        defaults_yml = (REPO_ROOT / "ansible" / "roles" / "jit_ca_target" / "defaults" / "main.yml").read_text()
+        tasks_yml = (REPO_ROOT / "ansible" / "roles" / "jit_ca_target" / "tasks" / "main.yml").read_text()
+        handlers_yml = (REPO_ROOT / "ansible" / "roles" / "jit_ca_target" / "handlers" / "main.yml").read_text()
+
+        self.assertIn("jit_ca_hypervisor_guard_enabled: false", defaults_yml)
+        self.assertIn("AuthorizedPrincipalsFile {{ jit_ca_principals_dir }}/%u", tasks_yml)
+        self.assertIn("ssh.socket", handlers_yml)
+
+        for script_name in ("inject-host-identity.sh", "jit-ca-set-host", "jit-ca-evacuate"):
+            p = REPO_ROOT / "contrib" / "proxmox-hypervisor-guard" / script_name
+            self.assertTrue(p.is_file(), f"Missing {p}")
+            self.assertTrue(os.access(p, os.X_OK), f"{p} is not executable")
+
 
 if __name__ == "__main__":
     unittest.main()

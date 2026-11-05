@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Installed at /usr/local/libexec/jit-ca-evacuate inside the jit-ca VM.
+# Called by jit-ca-approver when an approved request targets the Proxmox node
+# currently hosting the jit-ca VM (`target == /run/jit-ca/current-hypervisor`).
+#
+# Reads /etc/jit-ca/proxmox-evacuate.conf:
+#   PVE_VMID="1901"
+#   PVE_PEER_MAP="optimuxprime:metroplex,metroplex:optimuxprime"
+#   PVE_API_URL_optimuxprime="https://10.6.1.2:8006"
+#   PVE_API_URL_metroplex="https://10.6.1.1:8006"
+#   PVE_API_TOKEN="PVEAPIToken=jit-ca@pve!evacuate=..."
+set -euo pipefail
+
+TARGET_HOST="${1:-}"
+CONF="/etc/jit-ca/proxmox-evacuate.conf"
+
+if [[ -z "$TARGET_HOST" ]]; then
+    echo "missing target host" >&2
+    exit 2
+fi
+if [[ ! -r "$CONF" ]]; then
+    echo "missing $CONF" >&2
+    exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$CONF"
+
+# Resolve peer node for TARGET_HOST from PVE_PEER_MAP ("nodeA:nodeB,nodeB:nodeA")
+PEER_NODE=""
+IFS=',' read -ra PAIRS <<< "${PVE_PEER_MAP:-}"
+for pair in "${PAIRS[@]}"; do
+    src="${pair%%:*}"
+    dst="${pair#*:}"
+    if [[ "$src" == "$TARGET_HOST" ]]; then
+        PEER_NODE="$dst"
+        break
+    fi
+done
+
+if [[ -z "$PEER_NODE" ]]; then
+    echo "no peer hypervisor configured for $TARGET_HOST" >&2
+    exit 3
+fi
+
+API_VAR="PVE_API_URL_${TARGET_HOST}"
+API_URL="${!API_VAR:-}"
+if [[ -z "$API_URL" || -z "${PVE_API_TOKEN:-}" || -z "${PVE_VMID:-}" ]]; then
+    echo "incomplete PVE API settings for $TARGET_HOST in $CONF" >&2
+    exit 4
+fi
+
+# Trigger online live migration of the jit-ca VM to PEER_NODE
+curl --fail --silent --show-error --insecure     -X POST     -H "Authorization: ${PVE_API_TOKEN}"     --data-urlencode "target=${PEER_NODE}"     --data-urlencode "online=1"     --data-urlencode "with-local-disks=1"     "${API_URL}/api2/json/nodes/${TARGET_HOST}/qemu/${PVE_VMID}/migrate" >/dev/null
+
+# Wait up to 90s for post-migration hookscript (or self-update) to reflect PEER_NODE
+for _ in $(seq 1 45); do
+    if [[ -r /run/jit-ca/current-hypervisor ]]; then
+        CUR="$(tr -d '[:space:]' < /run/jit-ca/current-hypervisor)"
+        if [[ "$CUR" == "$PEER_NODE" ]]; then
+            exit 0
+        fi
+    fi
+    sleep 2
+done
+
+echo "timed out waiting for /run/jit-ca/current-hypervisor to become $PEER_NODE" >&2
+exit 5

@@ -1,0 +1,13 @@
+---
+# Debian 13+ uses socket-activated sshd (ssh.socket), where each new connection
+# spawns a fresh sshd reading /etc/ssh/sshd_config.d/ automatically, and
+# calling 'systemctl reload ssh' can fail if no persistent listener unit is active.
+- name: Reload sshd safely
+  ansible.builtin.shell: |
+    set -e
+    /usr/sbin/sshd -t
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+      exit 0
+    fi
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || kill -HUP "$(cat /run/sshd.pid)"
+  changed_when: true

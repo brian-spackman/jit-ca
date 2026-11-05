@@ -60,6 +60,12 @@ MAX_REASON_CHARS = 200                      # upper bound on sanitized reason st
 # PLACEHOLDER: list your target hostnames here; requests for anything not in
 # this set are rejected before a notification is even sent.
 TARGET_ALLOWLIST = {"target-host-1", "target-host-2"}
+
+# Optional hypervisor self-reference guard (see contrib/proxmox-hypervisor-guard/).
+# By default CURRENT_HOST_FILE does not exist on disk and these checks are a pure no-op.
+CURRENT_HOST_FILE = "/run/jit-ca/current-hypervisor"
+EVACUATE_CMD = "/usr/local/libexec/jit-ca-evacuate"
+EVACUATE_TIMEOUT = 120
 DURATION_RE = re.compile(r"^(\d+)([mh])$")
 REQ_ID_RE = re.compile(r"^[0-9a-f]{16,64}$")
 CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]+")
@@ -79,6 +85,22 @@ def log(msg):
 
 def target_principal(target):
     return f"{PRINCIPAL}@{target}" if target else PRINCIPAL
+
+
+def current_hypervisor():
+    """Return the hypervisor hostname hosting this CA VM if injected, else None."""
+    if not CURRENT_HOST_FILE or not os.path.exists(CURRENT_HOST_FILE):
+        return None
+    try:
+        with open(CURRENT_HOST_FILE) as fh:
+            host = fh.read().strip()
+        return host or None
+    except OSError:
+        return None
+
+
+def can_evacuate():
+    return bool(EVACUATE_CMD and os.path.isfile(EVACUATE_CMD) and os.access(EVACUATE_CMD, os.X_OK))
 
 
 def sanitize_reason(raw):
@@ -239,8 +261,39 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(410, "token invalid or expired")
 
         rec = entry["record"]
+        target = rec.get("target")
+        cur_host = current_hypervisor()
+        if cur_host and target == cur_host:
+            if not can_evacuate():
+                log(f"blocked self-referential sign for current hypervisor {target!r} (no evacuate script)")
+                audit("SIGN_BLOCKED_SELF_HOST", rec, extra=f"hypervisor={json.dumps(cur_host)}")
+                ntfy_publish(TOPIC_APPROVE,
+                             f"Blocked: {target} is currently hosting jit-ca and no evacuate helper is installed.",
+                             title="JIT self-reference blocked", tags=["no_entry"])
+                return self._reply(409, "target is current hypervisor")
+            try:
+                subprocess.run([EVACUATE_CMD, target], check=True,
+                               capture_output=True, text=True, timeout=EVACUATE_TIMEOUT)
+            except (subprocess.SubprocessError, OSError) as e:
+                err_msg = getattr(e, "stderr", "") or str(e)
+                log(f"evacuation from {target!r} failed: {err_msg}")
+                audit("EVACUATE_FAIL", rec, extra=f"err={json.dumps(err_msg[:200])}")
+                ntfy_publish(TOPIC_APPROVE,
+                             f"Evacuation from {target} FAILED — certificate NOT minted.",
+                             title="JIT evacuation failed", tags=["rotating_light"])
+                return self._reply(500, "evacuation failed")
+            post_host = current_hypervisor()
+            if post_host == target:
+                log(f"evacuation script exited 0 but current_hypervisor is still {target!r}")
+                audit("EVACUATE_FAIL", rec, extra='"still_on_target_hypervisor"')
+                ntfy_publish(TOPIC_APPROVE,
+                             f"Evacuation incomplete (still on {target}) — certificate NOT minted.",
+                             title="JIT evacuation incomplete", tags=["rotating_light"])
+                return self._reply(409, "still on target hypervisor")
+            audit("EVACUATE", rec, extra=f"from={json.dumps(cur_host)} to={json.dumps(post_host)}")
+
         try:
-            cert_text, valid = sign_cert(rec["pubkey"], rec["duration"], rec.get("target"))
+            cert_text, valid = sign_cert(rec["pubkey"], rec["duration"], target)
         except subprocess.CalledProcessError as e:
             log(f"sign failed: {e.stderr}")
             audit("SIGN_FAIL", rec, extra=f"err={json.dumps((e.stderr or '')[:200])}")
@@ -308,20 +361,37 @@ def handle_request(payload):
     rec["req_id"] = req_id
     rec["duration"] = duration
     rec["reason"] = reason
+
+    cur_host = current_hypervisor()
+    approve_label = "Approve"
+    title = "Agent wants SSH access"
+    msg_body = f"{target} for {duration}: {reason}"
+    if cur_host and target == cur_host:
+        if not can_evacuate():
+            log(f"rejecting request for current hypervisor {target!r} (no evacuate helper)")
+            audit("REJECT_SELF_HOST", rec, extra=f"hypervisor={json.dumps(cur_host)}")
+            ntfy_publish(TOPIC_APPROVE,
+                         f"Rejected request for {target}: jit-ca is currently hosted on {target} and no evacuate helper is configured.",
+                         title="JIT self-reference rejected", tags=["no_entry"])
+            return
+        approve_label = "Approve: Evacuate & Mint"
+        title = f"Evacuate jit-ca from {target} & grant SSH?"
+        msg_body = f"[Self-Host Guard: evacuate {target} -> peer first] {target} for {duration}: {reason}"
+
     token = secrets.token_urlsafe(32)
     with _lock:
         _pending[token] = {"record": rec, "expiry": time.time() + TOKEN_TTL}
 
     actions = [
-        {"action": "http", "label": "Approve", "url": f"{WEBHOOK_URL}/approve",
+        {"action": "http", "label": approve_label, "url": f"{WEBHOOK_URL}/approve",
          "method": "POST", "body": token, "clear": True},
         {"action": "http", "label": "Deny", "url": f"{WEBHOOK_URL}/deny",
          "method": "POST", "body": token, "clear": True},
     ]
     ntfy_publish(
         TOPIC_APPROVE,
-        f"{target} for {duration}: {reason}",
-        title="Agent wants SSH access",
+        msg_body,
+        title=title,
         actions=actions,
         priority=5,  # ntfy JSON API: integer 1-5 (5=max), not the header-style "high"
         tags=["closed_lock_with_key"],

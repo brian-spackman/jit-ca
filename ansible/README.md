@@ -1,21 +1,29 @@
-# Airlock Target Onboarding (Ansible)
+# Airlock Ansible Playbooks & Roles (`airlock_server` & `airlock_target`)
 
-Automates **Section 7 (Onboarding a target host)** and **Section 10 (Break-glass recovery)** of [`../REPLICATION-GUIDE.md`](../REPLICATION-GUIDE.md) idempotently across Debian/Ubuntu targets (including Debian 13+ socket-activated `ssh.socket`).
+This directory provides two idempotent Ansible playbooks and roles:
 
-## What `roles/airlock_target` Does
-
-1. **Creates the agent service user** (`airlock_principal_user`, default `agent`) with a locked password (`passwd -l`) and passwordless sudo (`/etc/sudoers.d/<user>`, validated via `visudo -cf`).
-2. **Installs the SSH User CA public key** to `/etc/ssh/trusted_user_ca_keys` (`0644`).
-3. **Binds the per-target principal** (`<user>@<target_hostname>`) in `/etc/ssh/airlock_principals/<user>` so a certificate minted for `target-a` is rejected by `target-b` and cannot authenticate as `root`.
-4. **Installs `/etc/ssh/sshd_config.d/10-airlock.conf`**, validates syntax with `sshd -t`, and reloads `sshd` safely (skipping reload when `ssh.socket` socket-activation is active on Debian 13+).
-5. **Optional Break-Glass Key Lockdown (`airlock_manage_authorized_keys: true`):** Replaces `~/.ssh/authorized_keys` with your offline/1Password break-glass public key (`airlock_break_glass_pubkey`) so no standing agent key remains on the box.
-6. **Optional Proxmox Hypervisor Guard (`airlock_hypervisor_guard_enabled: false` by default):** Leave `false` for normal targets. See [`../contrib/proxmox-hypervisor-guard/`](../contrib/proxmox-hypervisor-guard/) if running `airlock` inside a multi-node Proxmox cluster where the CA VM also governs its own hypervisors.
+1. **`deploy-airlock.yml` (`roles/airlock_server`):** Provisions the Airlock server itself (`VM 1901`) — installs `step-ca`, `ntfy`, `ufw`, `qemu-guest-agent`, initializes the SSH CA and Day-0 `birth_key`, configures `/usr/local/bin/airlock-approver` and `airlock-approver.service`, and optionally installs the Proxmox hypervisor self-reference guard helpers (`airlock-set-host` and `airlock-evacuate`).
+2. **`onboard-target.yml` (`roles/airlock_target`):** Onboards target Linux hosts/containers to trust the Airlock SSH User CA — creates the principal user (`airlock_principal_user`, default `airlock-admin`), configures passwordless sudo, installs `/etc/ssh/trusted_user_ca_keys`, writes `/etc/ssh/airlock_principals/<user>` with `<user>@<target>` (and any `approved-by-<approver>@<target>` entries from `airlock_allowed_approvers`), configures `/etc/ssh/sshd_config.d/10-airlock.conf`, optionally locks `~/.ssh/authorized_keys` to only the escrowed per-target break-glass key (`airlock_manage_authorized_keys: true`), and scrubs the Day-0 template `birth_key` (`airlock_purge_birth_pubkey`).
 
 ## Quick Start
 
 ```bash
 cp inventory.example.yml inventory.yml
-# Edit inventory.yml with your target IP(s) and ssh_user_ca_key.pub
+# 1. Provision or update the Airlock server:
+ansible-playbook -i inventory.yml deploy-airlock.yml --check --diff
+ansible-playbook -i inventory.yml deploy-airlock.yml
+
+# 2. Onboard target hosts:
 ansible-playbook -i inventory.yml onboard-target.yml --check --diff
 ansible-playbook -i inventory.yml onboard-target.yml
 ```
+
+## Day-0 Tap-to-Enroll (`airlock-enroll`)
+
+When Proxmox VM/LXC templates are seeded with `/etc/airlock/secrets/birth_key.pub`, any agent can request zero-standing-access enrollment of a newly created container/VM:
+
+```bash
+airlock-enroll <target-hostname> <target-ip> "<reason>" [approver]
+```
+
+When approved on the designated approver's `ntfy` channel, `airlock-approver` automatically generates a fresh per-target `ed25519` break-glass keypair, escrows the private key (`0600`) to `/etc/airlock/secrets/break-glass/<target>.id_ed25519` (and/or `BREAK_GLASS_ESCROW_CMD`), runs `onboard-target.yml` over `birth_key`, scrubs `birth_key.pub` from the target, and persists `<target>` to `/etc/airlock/target-allowlist.txt`.

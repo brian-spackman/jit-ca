@@ -8,6 +8,8 @@ Requires=ntfy.service step-ca.service
 Type=simple
 User=step
 Group=step
+Environment="HOME=/tmp"
+Environment="ANSIBLE_LOCAL_TEMP=/tmp/.ansible-tmp"
 ExecStart=/usr/bin/python3 /usr/local/bin/airlock-approver
 Restart=on-failure
 RestartSec=5
@@ -17,8 +19,8 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 LogsDirectory=airlock
-ReadWritePaths=/var/log/airlock
 ReadOnlyPaths=/etc/airlock
+ReadWritePaths=/var/log/airlock -/etc/airlock/secrets/break-glass -/etc/airlock/target-allowlist.txt
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

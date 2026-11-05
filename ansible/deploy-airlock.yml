@@ -1,0 +1,6 @@
+---
+- name: Provision Airlock Server (step-ca + ntfy + airlock-approver + Day-0 enrollment engine)
+  hosts: airlock_servers
+  become: true
+  roles:
+    - role: airlock_server

@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 .adjudication-verdict.json
 .DS_Store
+.pytest_cache/

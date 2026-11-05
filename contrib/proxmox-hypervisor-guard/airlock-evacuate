@@ -9,13 +9,16 @@
 #   PVE_API_URL_optimuxprime="https://10.6.1.2:8006"
 #   PVE_API_URL_metroplex="https://10.6.1.1:8006"
 #   PVE_API_TOKEN="PVEAPIToken=airlock@pve!evacuate=..."
+#   PVE_CACERT="/etc/airlock/certs/pve-root-ca.pem"   # optional CA bundle for PVE API
+#   PVE_TLS_INSECURE="false"                          # set "true" only for self-signed PVE without CACERT
 set -euo pipefail
 
-TARGET_HOST="${1:-}"
+RAW_TARGET="${1:-}"
+TARGET_HOST="${RAW_TARGET,,}"
 CONF="/etc/airlock/proxmox-evacuate.conf"
 
-if [[ -z "$TARGET_HOST" ]]; then
-    echo "missing target host" >&2
+if [[ -z "$TARGET_HOST" || ! "$TARGET_HOST" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then
+    echo "missing or invalid target host" >&2
     exit 2
 fi
 if [[ ! -r "$CONF" ]]; then
@@ -43,21 +46,32 @@ if [[ -z "$PEER_NODE" ]]; then
     exit 3
 fi
 
-API_VAR="PVE_API_URL_${TARGET_HOST}"
+SAFE_HOST="${TARGET_HOST//[-.]/_}"
+API_VAR="PVE_API_URL_${SAFE_HOST}"
 API_URL="${!API_VAR:-}"
 if [[ -z "$API_URL" || -z "${PVE_API_TOKEN:-}" || -z "${PVE_VMID:-}" ]]; then
     echo "incomplete PVE API settings for $TARGET_HOST in $CONF" >&2
     exit 4
 fi
 
+CURL_TLS_ARGS=()
+if [[ -n "${PVE_CACERT:-}" && -r "${PVE_CACERT}" ]]; then
+    CURL_TLS_ARGS+=(--cacert "${PVE_CACERT}")
+elif [[ "${PVE_TLS_INSECURE:-false}" == "true" ]]; then
+    CURL_TLS_ARGS+=(--insecure)
+fi
+
 # Trigger online live migration of the Airlock VM to PEER_NODE
-curl --fail --silent --show-error --insecure \
+# Pass Authorization header via stdin (--config -) so PVE_API_TOKEN never appears in /proc/<pid>/cmdline.
+curl --fail --silent --show-error "${CURL_TLS_ARGS[@]}" \
     -X POST \
-    -H "Authorization: ${PVE_API_TOKEN}" \
+    --config - \
     --data-urlencode "target=${PEER_NODE}" \
     --data-urlencode "online=1" \
     --data-urlencode "with-local-disks=1" \
-    "${API_URL}/api2/json/nodes/${TARGET_HOST}/qemu/${PVE_VMID}/migrate" >/dev/null
+    "${API_URL}/api2/json/nodes/${TARGET_HOST}/qemu/${PVE_VMID}/migrate" >/dev/null <<EOF
+header = "Authorization: ${PVE_API_TOKEN}"
+EOF
 
 # Wait up to 90s for post-migration hookscript (or self-update) to reflect PEER_NODE
 for _ in $(seq 1 45); do

@@ -1,0 +1,260 @@
+---
+- name: Validate airlock_precheck_mode value
+  ansible.builtin.assert:
+    that:
+      - airlock_precheck_mode in ['boundary_only', 'silent_precheck']
+    fail_msg: "airlock_precheck_mode must be 'boundary_only' or 'silent_precheck'."
+
+- name: Install baseline packages for Airlock server
+  ansible.builtin.apt:
+    name:
+      - python3
+      - ufw
+      - ansible
+      - openssh-client
+      - curl
+      - ca-certificates
+      - gnupg
+      - qemu-guest-agent
+    state: present
+    update_cache: true
+
+- name: Ensure step system group exists
+  ansible.builtin.group:
+    name: step
+    system: true
+    state: present
+
+- name: Ensure step system user exists
+  ansible.builtin.user:
+    name: step
+    group: step
+    system: true
+    home: /etc/airlock
+    create_home: false
+    shell: /usr/sbin/nologin
+    state: present
+
+- name: Create /etc/airlock and /var/log/airlock directory hierarchy
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: step
+    group: step
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "/etc/airlock", mode: "0755" }
+    - { path: "/etc/airlock/db", mode: "0700" }
+    - { path: "/etc/airlock/secrets", mode: "0700" }
+    - { path: "/etc/airlock/secrets/break-glass", mode: "0700" }
+    - { path: "/etc/airlock/certs", mode: "0755" }
+    - { path: "/etc/airlock/ansible", mode: "0755" }
+    - { path: "/etc/airlock/contrib", mode: "0755" }
+    - { path: "/var/log/airlock", mode: "0750" }
+
+- name: Generate provisioner password if not already present
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 0077
+    head -c 32 /dev/urandom | base64 > /etc/airlock/secrets/provisioner_password
+    chown step:step /etc/airlock/secrets/provisioner_password
+    chmod 0600 /etc/airlock/secrets/provisioner_password
+  args:
+    executable: /bin/bash
+    creates: /etc/airlock/secrets/provisioner_password
+
+- name: Seed /etc/airlock/secrets/ntfy-approver-token if not already present
+  ansible.builtin.copy:
+    dest: /etc/airlock/secrets/ntfy-approver-token
+    content: "{{ (airlock_ntfy_approver_token | trim) ~ '\n' }}"
+    owner: step
+    group: step
+    mode: "0600"
+    force: false
+  no_log: true
+
+- name: Generate Day-0 Proxmox template birth keypair if not already present
+  ansible.builtin.command:
+    cmd: >
+      ssh-keygen -t ed25519 -N "" -q
+      -C "airlock-birth-key"
+      -f /etc/airlock/secrets/birth_key
+    creates: /etc/airlock/secrets/birth_key
+  become: true
+  become_user: step
+
+- name: Ensure strict permissions on birth_key files
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: step
+    group: step
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "/etc/airlock/secrets/birth_key", mode: "0600" }
+    - { path: "/etc/airlock/secrets/birth_key.pub", mode: "0644" }
+  when: not ansible_check_mode
+
+- name: Initialize step-ca with SSH certificate support if not already initialized
+  ansible.builtin.command:
+    cmd: >
+      step ca init
+      --ssh
+      --name="{{ airlock_ca_name }}"
+      --dns="{{ airlock_ca_dns }}"
+      --address="{{ airlock_ca_address }}"
+      --provisioner="{{ airlock_provisioner_name }}"
+      --password-file=/etc/airlock/secrets/provisioner_password
+      --provisioner-password-file=/etc/airlock/secrets/provisioner_password
+    creates: /etc/airlock/config/ca.json
+  environment:
+    STEPPATH: /etc/airlock
+  become: true
+  become_user: step
+  notify: Restart step-ca
+
+- name: Install step-ca systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/step-ca.service
+    content: |
+      [Unit]
+      Description=step-ca (Airlock SSH CA)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=step
+      Group=step
+      Environment=STEPPATH=/etc/airlock
+      WorkingDirectory=/etc/airlock
+      ExecStart=/usr/bin/step-ca /etc/airlock/config/ca.json --password-file=/etc/airlock/secrets/provisioner_password
+      Restart=on-failure
+      RestartSec=5
+      NoNewPrivileges=true
+      ProtectSystem=strict
+      ProtectHome=true
+      PrivateTmp=true
+      ReadOnlyPaths=/etc/airlock
+      ReadWritePaths=/etc/airlock/db
+      ProtectKernelTunables=true
+      ProtectControlGroups=true
+      RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+      [Install]
+      WantedBy=multi-user.target
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd daemon
+    - Restart step-ca
+
+- name: Sync onboard-target.yml, airlock_target role, and contrib helpers to /etc/airlock
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: step
+    group: step
+    mode: "{{ item.mode | default(omit) }}"
+  loop:
+    - { src: "{{ playbook_dir }}/onboard-target.yml", dest: "/etc/airlock/ansible/onboard-target.yml", mode: "0644" }
+    - { src: "{{ playbook_dir }}/roles", dest: "/etc/airlock/ansible/" }
+    - { src: "{{ playbook_dir }}/../contrib/proxmox-hypervisor-guard", dest: "/etc/airlock/contrib/" }
+
+- name: Seed /etc/airlock/target-allowlist.txt if not already present
+  ansible.builtin.copy:
+    dest: /etc/airlock/target-allowlist.txt
+    content: |
+      {% for t in airlock_initial_targets %}
+      {{ t }}
+      {% endfor %}
+    owner: step
+    group: step
+    mode: "0644"
+    force: false
+
+- name: Render and install configured /usr/local/bin/airlock-approver atomically (idempotent)
+  ansible.builtin.copy:
+    dest: /usr/local/bin/airlock-approver
+    content: >-
+      {{
+        lookup('file', playbook_dir ~ '/../scripts/airlock-approver.py')
+        | regex_replace('(?m)^NTFY_LOCAL = .*$', 'NTFY_LOCAL = "http://' ~ airlock_host_ip ~ ':' ~ (airlock_ntfy_port | string) ~ '"')
+        | regex_replace('(?m)^WEBHOOK_HOST = .*$', 'WEBHOOK_HOST = "' ~ airlock_host_ip ~ '"')
+        | regex_replace('(?m)^WEBHOOK_PORT = .*$', 'WEBHOOK_PORT = ' ~ (airlock_webhook_port | string))
+        | regex_replace('(?m)^TOPIC_REQ = .*$', 'TOPIC_REQ = "' ~ airlock_topic_req ~ '"')
+        | regex_replace('(?m)^TOPIC_APPROVE = .*$', 'TOPIC_APPROVE = "' ~ airlock_topic_approve ~ '"')
+        | regex_replace('(?m)^TOPIC_CERT = .*$', 'TOPIC_CERT = "' ~ airlock_topic_cert ~ '"')
+        | regex_replace('(?m)^DEFAULT_APPROVER = .*$', 'DEFAULT_APPROVER = "' ~ airlock_default_approver ~ '"')
+        | regex_replace('(?m)^PER_APPROVER_TOPICS = .*$', 'PER_APPROVER_TOPICS = ' ~ ('True' if (airlock_per_approver_topics | bool) else 'False'))
+        | regex_replace('(?m)^STAMP_APPROVER_PRINCIPAL = .*$', 'STAMP_APPROVER_PRINCIPAL = ' ~ ('True' if (airlock_stamp_approver_principal | bool) else 'False'))
+        | regex_replace('(?m)^PRECHECK_MODE = .*$', 'PRECHECK_MODE = "' ~ airlock_precheck_mode ~ '"')
+        | regex_replace('(?m)^OPA_PRECHECK_URL = .*$', 'OPA_PRECHECK_URL = "' ~ airlock_opa_precheck_url ~ '"')
+        | regex_replace('(?m)^PROVISIONER = .*$', 'PROVISIONER = "' ~ airlock_provisioner_name ~ '"')
+        | regex_replace('(?m)^PRINCIPAL = .*$', 'PRINCIPAL = "' ~ airlock_principal_user ~ '"')
+        | regex_replace('(?m)^TARGET_ALLOWLIST = .*$', 'TARGET_ALLOWLIST = set(' ~ (airlock_initial_targets | to_json) ~ ')')
+        | regex_replace('(?m)^BOOTSTRAP_USER = .*$', 'BOOTSTRAP_USER = "' ~ airlock_bootstrap_user ~ '"')
+        | regex_replace('(?m)^BREAK_GLASS_ESCROW_CMD = .*$', 'BREAK_GLASS_ESCROW_CMD = "' ~ airlock_break_glass_escrow_cmd ~ '"')
+      }}
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart airlock-approver
+
+- name: Install airlock-approver systemd unit
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/airlock-approver.service"
+    dest: /etc/systemd/system/airlock-approver.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd daemon
+    - Restart airlock-approver
+
+- name: Install optional Proxmox hypervisor guard helpers inside Airlock VM (when enabled)
+  block:
+    - name: Install airlock-set-host and airlock-evacuate to /usr/local/libexec
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../contrib/proxmox-hypervisor-guard/{{ item }}"
+        dest: "/usr/local/libexec/{{ item }}"
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - airlock-set-host
+        - airlock-evacuate
+
+    - name: Render /etc/airlock/proxmox-evacuate.conf
+      ansible.builtin.copy:
+        dest: /etc/airlock/proxmox-evacuate.conf
+        content: |
+          PVE_VMID="{{ airlock_pve_vmid }}"
+          PVE_PEER_MAP="{{ airlock_pve_peer_map }}"
+          {% for node, url in airlock_pve_api_urls.items() %}
+          PVE_API_URL_{{ node | replace('-', '_') | replace('.', '_') }}="{{ url }}"
+          {% endfor %}
+          PVE_API_TOKEN="{{ airlock_pve_api_token }}"
+          PVE_CACERT="{{ airlock_pve_cacert }}"
+          PVE_TLS_INSECURE="{{ 'true' if (airlock_pve_tls_insecure | bool) else 'false' }}"
+        owner: root
+        group: step
+        mode: "0440"
+      no_log: true
+  when: airlock_hypervisor_guard_enabled | bool
+
+- name: Configure UFW inbound rules for Airlock (SSH 22, ntfy {{ airlock_ntfy_port }}, webhook {{ airlock_webhook_port }})
+  ansible.builtin.shell: |
+    set -euo pipefail
+    ufw default deny incoming
+    ufw default allow outgoing
+    for cidr in "{{ airlock_lan_subnet }}" "{{ airlock_vpn_subnet }}" {% for s in airlock_extra_allowed_subnets %}"{{ s }}" {% endfor %}; do
+      [ -z "$cidr" ] && continue
+      ufw allow from "$cidr" to any port 22 proto tcp comment "airlock ssh"
+      ufw allow from "$cidr" to any port {{ airlock_ntfy_port }} proto tcp comment "airlock ntfy"
+      ufw allow from "$cidr" to any port {{ airlock_webhook_port }} proto tcp comment "airlock approve webhook"
+    done
+    ufw --force enable
+  args:
+    executable: /bin/bash
+  changed_when: false

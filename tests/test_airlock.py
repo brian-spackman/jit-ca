@@ -1022,5 +1022,147 @@ class TestNewReviewFixes(unittest.TestCase):
         self.assertIn("PRECHECK_DENIED", Path(self.audit_file).read_text())
 
 
+    def test_airlock10_enroll_protects_existing_break_glass_and_rolls_back_on_failure(self):
+        """AIRLOCK-10a (QA-01, QA-06, QA-09): Rejects re-enrolling an already-enrolled/escrowed target and rolls back staged key if playbook fails."""
+        ca_pub = Path(self.tmpdir.name) / "user_ca.pub"
+        ca_pub.write_text(SAMPLE_PUBKEY + "\n")
+        birth_key = Path(self.tmpdir.name) / "birth_key"
+        birth_key.write_text("PRIVATE_BIRTH_KEY\n")
+        playbook = Path(self.tmpdir.name) / "onboard-target.yml"
+        playbook.write_text("---\n- hosts: airlock_targets\n")
+        escrow_dir = Path(self.tmpdir.name) / "escrow"
+        escrow_dir.mkdir(parents=True, exist_ok=True)
+
+        self.approver.USER_CA_PUBKEY_FILE = str(ca_pub)
+        self.approver.BIRTH_KEY_FILE = str(birth_key)
+        self.approver.ONBOARD_PLAYBOOK = str(playbook)
+        self.approver.BREAK_GLASS_ESCROW_DIR = str(escrow_dir)
+        self.approver.ALLOWLIST_FILE = ""
+
+        # 1. Target already in TARGET_ALLOWLIST ('target-host-1') must be rejected at handle_request
+        self.approver.handle_request(json.dumps({
+            "action": "enroll",
+            "req_id": SAMPLE_REQ_ID,
+            "target": "target-host-1",
+            "target_ip": "10.6.31.1",
+            "reason": "attempt re-enroll",
+        }))
+        self.assertEqual(len(self.approver._pending), 0)
+
+        # 2. Target with pre-existing escrowed break-glass key must be rejected and key preserved
+        existing_priv = escrow_dir / "existing-box.id_ed25519"
+        existing_priv.write_text("PRECIOUS_EXISTING_BREAK_GLASS_KEY\n")
+        self.approver.handle_request(json.dumps({
+            "action": "enroll",
+            "req_id": SAMPLE_REQ_ID,
+            "target": "existing-box",
+            "target_ip": "10.6.31.2",
+            "reason": "attempt overwrite",
+        }))
+        self.assertEqual(len(self.approver._pending), 0)
+        self.assertEqual(existing_priv.read_text(), "PRECIOUS_EXISTING_BREAK_GLASS_KEY\n")
+
+        # 3. Duplicate pending enroll request for the same new target is deduplicated
+        self.approver.handle_request(json.dumps({
+            "action": "enroll",
+            "req_id": SAMPLE_REQ_ID,
+            "target": "fresh-box",
+            "target_ip": "10.6.31.3",
+            "reason": "first request",
+        }))
+        self.approver.handle_request(json.dumps({
+            "action": "enroll",
+            "req_id": "b1b2c3d4e5f60718",
+            "target": "fresh-box",
+            "target_ip": "10.6.31.3",
+            "reason": "duplicate request",
+        }))
+        self.assertEqual(len(self.approver._pending), 1)
+        token = next(iter(self.approver._pending.keys()))
+
+        # 4. If playbook fails, staged escrow key for 'fresh-box' is rolled back so retry can succeed
+        real_run = subprocess.run
+
+        def fail_once(cmd, *a, **kw):
+            if cmd[0] == "ssh-keygen":
+                return real_run(cmd, *a, **kw)
+            if cmd[0] == self.approver.ANSIBLE_PLAYBOOK_CMD:
+                raise subprocess.TimeoutExpired(cmd, 120)
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        with mock.patch.object(self.approver.subprocess, "run", side_effect=fail_once):
+            code, _ = self._invoke_post("/approve", token)
+
+        self.assertEqual(code, 500)
+        self.assertFalse((escrow_dir / "fresh-box.id_ed25519").exists())
+        self.assertIn("ENROLL_FAIL", Path(self.audit_file).read_text())
+
+    def test_airlock10_enroll_ignores_untrusted_rec_overrides(self):
+        """AIRLOCK-10b (QA-02): enroll_target ignores untrusted extra_authorized_keys or sshd_dropin_path in rec."""
+        ca_pub = Path(self.tmpdir.name) / "user_ca.pub"
+        ca_pub.write_text(SAMPLE_PUBKEY + "\n")
+        birth_key = Path(self.tmpdir.name) / "birth_key"
+        birth_key.write_text("PRIVATE_BIRTH_KEY\n")
+        playbook = Path(self.tmpdir.name) / "onboard-target.yml"
+        playbook.write_text("---\n- hosts: airlock_targets\n")
+        escrow_dir = Path(self.tmpdir.name) / "escrow"
+
+        self.approver.USER_CA_PUBKEY_FILE = str(ca_pub)
+        self.approver.BIRTH_KEY_FILE = str(birth_key)
+        self.approver.ONBOARD_PLAYBOOK = str(playbook)
+        self.approver.BREAK_GLASS_ESCROW_DIR = str(escrow_dir)
+        self.approver.ALLOWLIST_FILE = ""
+
+        captured_inv = {}
+        real_run = subprocess.run
+
+        def capture_playbook(cmd, *a, **kw):
+            if cmd[0] == "ssh-keygen":
+                return real_run(cmd, *a, **kw)
+            if cmd[0] == self.approver.ANSIBLE_PLAYBOOK_CMD:
+                inv_path = cmd[cmd.index("-i") + 1]
+                captured_inv.update(json.loads(Path(inv_path).read_text()))
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        with mock.patch.object(self.approver.subprocess, "run", side_effect=capture_playbook):
+            self.approver.enroll_target({
+                "target": "safe-box",
+                "target_ip": "10.6.31.4",
+                "extra_authorized_keys": ["ssh-ed25519 AAAA_ATTACKER"],
+                "sshd_dropin_path": "/etc/cron.d/pwn",
+                "principal_uid": 0,
+            })
+
+        hvars = captured_inv["all"]["children"]["airlock_targets"]["hosts"]["safe-box"]
+        self.assertEqual(hvars["airlock_extra_authorized_keys"], [])
+        self.assertNotIn("airlock_sshd_dropin_path", hvars)
+        self.assertNotIn("airlock_principal_uid", hvars)
+        self.assertIn("UserKnownHostsFile=", hvars["ansible_ssh_common_args"])
+
+    def test_airlock10_reap_expired_audits_and_evacuate_script_hardened(self):
+        """AIRLOCK-10c (QA-03, QA-04, QA-11, QA-15): reap_expired writes EXPIRE to audit log; airlock-evacuate & airlock_server are hardened."""
+        self.approver.handle_request(json.dumps({
+            "req_id": SAMPLE_REQ_ID,
+            "target": "target-host-1",
+            "duration": "30m",
+            "reason": "test expire audit",
+            "pubkey": SAMPLE_PUBKEY,
+        }))
+        token = next(iter(self.approver._pending.keys()))
+        self.approver._pending[token]["expiry"] = time.time() - 10
+        self.approver.reap_expired()
+        self.assertEqual(len(self.approver._pending), 0)
+        self.assertIn("EXPIRE", Path(self.audit_file).read_text())
+
+        evac_txt = (REPO_ROOT / "contrib" / "proxmox-hypervisor-guard" / "airlock-evacuate").read_text()
+        self.assertIn('SAFE_HOST="${TARGET_HOST//[-.]/_}"', evac_txt)
+        self.assertIn("--config -", evac_txt)
+
+        server_tasks = (REPO_ROOT / "ansible" / "roles" / "airlock_server" / "tasks" / "main.yml").read_text()
+        self.assertIn("/etc/airlock/db", server_tasks)
+        self.assertIn("--provisioner-password-file=/etc/airlock/secrets/provisioner_password", server_tasks)
+
+
 if __name__ == "__main__":
     unittest.main()

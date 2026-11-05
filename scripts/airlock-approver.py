@@ -19,11 +19,13 @@ Runs on the Airlock host as the `step` user. Two jobs in one process:
 See REPLICATION-GUIDE.md (Section 5) and AIRLOCK-SPEC.md for design rationale.
 """
 
+from collections import deque
 import ipaddress
 import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -87,6 +89,12 @@ ONBOARD_PLAYBOOK = "/etc/airlock/ansible/onboard-target.yml"
 BREAK_GLASS_ESCROW_DIR = "/etc/airlock/secrets/break-glass"
 BREAK_GLASS_ESCROW_CMD = ""                 # optional Vaultwarden/Bitwarden/1Password CLI hook
 ENROLL_TIMEOUT = 120
+# Server-side optional enrollment overrides (never sourced from untrusted agent request payloads):
+ENROLL_PRINCIPAL_UID = None
+ENROLL_PRINCIPALS_DIR = None
+ENROLL_SSHD_DROPIN_PATH = None
+ENROLL_ALLOWED_APPROVERS = []
+
 TARGET_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 APPROVER_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
 DURATION_RE = re.compile(r"^(\d+)([mh])$")
@@ -99,6 +107,10 @@ with open(TOKEN_FILE) as fh:
 # token -> {"record": {...}, "expiry": epoch}
 _pending = {}
 _lock = threading.Lock()
+_io_lock = threading.Lock()
+_enroll_lock = threading.Lock()
+_evac_lock = threading.Lock()
+_seen_req_ids = deque(maxlen=512)
 
 
 # ---- helpers ----------------------------------------------------------------
@@ -180,36 +192,45 @@ def can_evacuate():
 
 
 def is_target_allowlisted(target):
-    if target in TARGET_ALLOWLIST:
-        return True
-    if ALLOWLIST_FILE and os.path.isfile(ALLOWLIST_FILE):
-        try:
-            with open(ALLOWLIST_FILE) as fh:
-                for line in fh:
-                    item = line.split("#", 1)[0].strip()
-                    if item:
-                        TARGET_ALLOWLIST.add(item)
-        except OSError:
-            pass
-    return target in TARGET_ALLOWLIST
+    with _io_lock:
+        if target in TARGET_ALLOWLIST:
+            return True
+        if ALLOWLIST_FILE and os.path.isfile(ALLOWLIST_FILE):
+            try:
+                with open(ALLOWLIST_FILE) as fh:
+                    for line in fh:
+                        item = line.split("#", 1)[0].strip()
+                        if item:
+                            TARGET_ALLOWLIST.add(item)
+            except OSError:
+                pass
+        return target in TARGET_ALLOWLIST
 
 
 def persist_allowlisted_target(target):
-    TARGET_ALLOWLIST.add(target)
-    if not ALLOWLIST_FILE:
-        return
-    try:
-        parent = os.path.dirname(ALLOWLIST_FILE)
-        if parent and os.path.isdir(parent):
-            existing = set()
-            if os.path.isfile(ALLOWLIST_FILE):
-                with open(ALLOWLIST_FILE) as fh:
-                    existing = {ln.split("#", 1)[0].strip() for ln in fh if ln.strip()}
-            if target not in existing:
-                with open(ALLOWLIST_FILE, "a") as fh:
-                    fh.write(f"{target}\n")
-    except OSError as e:
-        log(f"warning: could not persist {target} to {ALLOWLIST_FILE}: {e}")
+    with _io_lock:
+        TARGET_ALLOWLIST.add(target)
+        if not ALLOWLIST_FILE:
+            return
+        try:
+            parent = os.path.dirname(ALLOWLIST_FILE)
+            if parent and os.path.isdir(parent):
+                existing = set()
+                if os.path.isfile(ALLOWLIST_FILE):
+                    with open(ALLOWLIST_FILE) as fh:
+                        existing = {ln.split("#", 1)[0].strip() for ln in fh if ln.strip()}
+                if target not in existing:
+                    with open(ALLOWLIST_FILE, "a") as fh:
+                        fh.write(f"{target}\n")
+        except OSError as e:
+            log(f"warning: could not persist {target} to {ALLOWLIST_FILE}: {e}")
+
+
+def has_escrowed_break_glass_key(target):
+    if not BREAK_GLASS_ESCROW_DIR or not target:
+        return False
+    priv_dest = os.path.join(BREAK_GLASS_ESCROW_DIR, f"{target}.id_ed25519")
+    return os.path.lexists(priv_dest)
 
 
 def validate_target_ip(raw_ip):
@@ -232,14 +253,17 @@ def validate_target_ip(raw_ip):
 
 def enroll_target(rec):
     """Day-0 target enrollment:
-    1. Generate fresh ed25519 break-glass keypair in a 0700 tempdir.
-    2. Escrow private break-glass key (fail-closed if escrow fails!).
-    3. Run ansible-playbook onboard-target.yml using BIRTH_KEY_FILE, installing CA trust,
+    1. Verify target is not already enrolled / escrowed (never overwrite an existing break-glass key!).
+    2. Generate fresh ed25519 break-glass keypair in a 0700 tempdir.
+    3. Escrow private break-glass key (fail-closed if escrow fails, roll back staged files if playbook fails).
+    4. Run ansible-playbook onboard-target.yml using BIRTH_KEY_FILE, installing CA trust,
        per-target principal, and replacing authorized_keys with ONLY break-glass.pub.
-    4. Add target to TARGET_ALLOWLIST and return (bg_fingerprint, bg_pub).
+    5. Add target to TARGET_ALLOWLIST and return (bg_fingerprint, bg_pub).
     """
     target = rec["target"]
     target_ip = rec["target_ip"]
+    if not TARGET_NAME_RE.match(target):
+        raise RuntimeError(f"invalid target hostname {target!r}")
     if not USER_CA_PUBKEY_FILE or not os.path.isfile(USER_CA_PUBKEY_FILE):
         raise RuntimeError(f"missing USER_CA_PUBKEY_FILE at {USER_CA_PUBKEY_FILE}")
     if not BIRTH_KEY_FILE or not os.path.isfile(BIRTH_KEY_FILE):
@@ -247,114 +271,136 @@ def enroll_target(rec):
     if not ONBOARD_PLAYBOOK or not os.path.isfile(ONBOARD_PLAYBOOK):
         raise RuntimeError(f"missing ONBOARD_PLAYBOOK at {ONBOARD_PLAYBOOK}")
 
-    with open(USER_CA_PUBKEY_FILE) as fh:
-        ca_pubkey = fh.read().strip()
-    birth_pubkey = ""
-    if os.path.isfile(BIRTH_KEY_FILE + ".pub"):
+    with _enroll_lock:
+        if is_target_allowlisted(target) or has_escrowed_break_glass_key(target):
+            raise RuntimeError(f"target {target!r} is already enrolled or already has an escrowed break-glass key")
+
+        with open(USER_CA_PUBKEY_FILE) as fh:
+            ca_pubkey = fh.read().strip()
+        birth_pubkey = ""
+        if os.path.isfile(BIRTH_KEY_FILE + ".pub"):
+            try:
+                with open(BIRTH_KEY_FILE + ".pub") as fh:
+                    birth_pubkey = fh.read().strip()
+            except OSError:
+                pass
+
+        tmpdir = tempfile.mkdtemp(prefix="airlock-enroll-", dir="/tmp")
+        os.chmod(tmpdir, 0o700)
+        bg_key = os.path.join(tmpdir, "bg_key")
+        bg_pub_file = bg_key + ".pub"
+        inv_file = os.path.join(tmpdir, "inventory.json")
+        known_hosts_file = os.path.join(tmpdir, "known_hosts")
+        staged_files = []
         try:
-            with open(BIRTH_KEY_FILE + ".pub") as fh:
-                birth_pubkey = fh.read().strip()
-        except OSError:
-            pass
-
-    tmpdir = tempfile.mkdtemp(prefix="airlock-enroll-")
-    os.chmod(tmpdir, 0o700)
-    bg_key = os.path.join(tmpdir, "bg_key")
-    bg_pub_file = bg_key + ".pub"
-    inv_file = os.path.join(tmpdir, "inventory.json")
-    try:
-        subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
-             "-C", f"{target}-break-glass", "-f", bg_key],
-            check=True, capture_output=True, text=True, timeout=15,
-        )
-        with open(bg_key) as fh:
-            bg_priv = fh.read()
-        with open(bg_pub_file) as fh:
-            bg_pub = fh.read().strip()
-
-        fp_out = subprocess.run(
-            ["ssh-keygen", "-lf", bg_pub_file],
-            check=True, capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
-        fingerprint = fp_out.split()[1] if len(fp_out.split()) >= 2 else fp_out
-
-        # Step 2: Fail-closed escrow of break-glass private key BEFORE touching target
-        escrowed = False
-        if BREAK_GLASS_ESCROW_CMD:
             subprocess.run(
-                [BREAK_GLASS_ESCROW_CMD, target, target_ip],
-                input=bg_priv, check=True, capture_output=True, text=True, timeout=30,
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                 "-C", f"{target}-break-glass", "-f", bg_key],
+                check=True, capture_output=True, text=True, timeout=15,
             )
-            escrowed = True
-        if BREAK_GLASS_ESCROW_DIR:
-            os.makedirs(BREAK_GLASS_ESCROW_DIR, mode=0o700, exist_ok=True)
-            priv_dest = os.path.join(BREAK_GLASS_ESCROW_DIR, f"{target}.id_ed25519")
-            pub_dest = os.path.join(BREAK_GLASS_ESCROW_DIR, f"{target}.id_ed25519.pub")
-            fd = os.open(priv_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as fh:
-                fh.write(bg_priv)
-            with open(pub_dest, "w") as fh:
-                fh.write(bg_pub + "\n")
-            os.chmod(pub_dest, 0o644)
-            escrowed = True
-        if not escrowed:
-            raise RuntimeError("no break-glass escrow destination configured")
+            with open(bg_key) as fh:
+                bg_priv = fh.read()
+            with open(bg_pub_file) as fh:
+                bg_pub = fh.read().strip()
 
-        # Step 3: Write single-host JSON inventory & run onboard-target.yml over birth_key
-        host_vars = {
-            "ansible_host": target_ip,
-            "ansible_user": BOOTSTRAP_USER,
-            "ansible_ssh_private_key_file": BIRTH_KEY_FILE,
-            "ansible_ssh_common_args": "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
-            "airlock_target_name": target,
-            "airlock_principal_user": PRINCIPAL,
-            "airlock_user_ca_pubkey": ca_pubkey,
-            "airlock_manage_authorized_keys": True,
-            "airlock_break_glass_pubkey": bg_pub,
-            "airlock_extra_authorized_keys": rec.get("extra_authorized_keys") or [],
-            "airlock_purge_birth_pubkey": birth_pubkey,
-        }
-        if rec.get("allowed_approvers"):
-            host_vars["airlock_allowed_approvers"] = list(rec["allowed_approvers"])
-        if rec.get("principal_uid") is not None:
-            host_vars["airlock_principal_uid"] = int(rec["principal_uid"])
-        if rec.get("principals_dir"):
-            host_vars["airlock_principals_dir"] = str(rec["principals_dir"])
-        if rec.get("sshd_dropin_path"):
-            host_vars["airlock_sshd_dropin_path"] = str(rec["sshd_dropin_path"])
+            fp_out = subprocess.run(
+                ["ssh-keygen", "-lf", bg_pub_file],
+                check=True, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            fingerprint = fp_out.split()[1] if len(fp_out.split()) >= 2 else fp_out
 
-        inv_data = {
-            "all": {
-                "children": {
-                    "airlock_targets": {
-                        "hosts": {
-                            target: host_vars,
+            # Step 2: Fail-closed escrow of break-glass private key BEFORE touching target
+            escrowed = False
+            if BREAK_GLASS_ESCROW_CMD:
+                subprocess.run(
+                    [BREAK_GLASS_ESCROW_CMD, target, target_ip],
+                    input=bg_priv, check=True, capture_output=True, text=True, timeout=30,
+                )
+                escrowed = True
+            if BREAK_GLASS_ESCROW_DIR:
+                os.makedirs(BREAK_GLASS_ESCROW_DIR, mode=0o700, exist_ok=True)
+                priv_dest = os.path.join(BREAK_GLASS_ESCROW_DIR, f"{target}.id_ed25519")
+                pub_dest = os.path.join(BREAK_GLASS_ESCROW_DIR, f"{target}.id_ed25519.pub")
+                open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(priv_dest, open_flags, 0o600)
+                staged_files.append(priv_dest)
+                with os.fdopen(fd, "w") as fh:
+                    os.fchmod(fh.fileno(), 0o600)
+                    fh.write(bg_priv)
+                fd_pub = os.open(pub_dest, open_flags, 0o644)
+                staged_files.append(pub_dest)
+                with os.fdopen(fd_pub, "w") as fh:
+                    os.fchmod(fh.fileno(), 0o644)
+                    fh.write(bg_pub + "\n")
+                escrowed = True
+            if not escrowed:
+                raise RuntimeError("no break-glass escrow destination configured")
+
+            # Step 3: Write single-host JSON inventory & run onboard-target.yml over birth_key
+            host_vars = {
+                "ansible_host": target_ip,
+                "ansible_user": BOOTSTRAP_USER,
+                "ansible_ssh_private_key_file": BIRTH_KEY_FILE,
+                "ansible_ssh_common_args": (
+                    f"-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+                    f"-o UserKnownHostsFile={known_hosts_file}"
+                ),
+                "airlock_target_name": target,
+                "airlock_principal_user": PRINCIPAL,
+                "airlock_user_ca_pubkey": ca_pubkey,
+                "airlock_manage_authorized_keys": True,
+                "airlock_break_glass_pubkey": bg_pub,
+                "airlock_extra_authorized_keys": [],
+                "airlock_purge_birth_pubkey": birth_pubkey,
+            }
+            if ENROLL_ALLOWED_APPROVERS:
+                host_vars["airlock_allowed_approvers"] = list(ENROLL_ALLOWED_APPROVERS)
+            if ENROLL_PRINCIPAL_UID is not None:
+                host_vars["airlock_principal_uid"] = int(ENROLL_PRINCIPAL_UID)
+            if ENROLL_PRINCIPALS_DIR:
+                host_vars["airlock_principals_dir"] = str(ENROLL_PRINCIPALS_DIR)
+            if ENROLL_SSHD_DROPIN_PATH:
+                host_vars["airlock_sshd_dropin_path"] = str(ENROLL_SSHD_DROPIN_PATH)
+
+            inv_data = {
+                "all": {
+                    "children": {
+                        "airlock_targets": {
+                            "hosts": {
+                                target: host_vars,
+                            }
                         }
                     }
                 }
             }
-        }
-        with open(inv_file, "w") as fh:
-            json.dump(inv_data, fh, indent=2)
+            with open(inv_file, "w") as fh:
+                json.dump(inv_data, fh, indent=2)
 
-        env = dict(os.environ, ANSIBLE_HOST_KEY_CHECKING="False", ANSIBLE_RETRY_FILES_ENABLED="False")
-        subprocess.run(
-            [ANSIBLE_PLAYBOOK_CMD, "-i", inv_file, ONBOARD_PLAYBOOK, "--limit", target],
-            env=env, check=True, capture_output=True, text=True, timeout=ENROLL_TIMEOUT,
-        )
-        persist_allowlisted_target(target)
-        return fingerprint, bg_pub
-    finally:
-        for f in (bg_key, bg_pub_file, inv_file):
+            env = dict(
+                os.environ,
+                HOME="/tmp",
+                ANSIBLE_LOCAL_TEMP=os.path.join(tmpdir, "ansible-tmp"),
+                ANSIBLE_HOST_KEY_CHECKING="False",
+                ANSIBLE_RETRY_FILES_ENABLED="False",
+            )
             try:
-                os.remove(f)
-            except OSError:
-                pass
-        try:
-            os.rmdir(tmpdir)
-        except OSError:
-            pass
+                subprocess.run(
+                    [ANSIBLE_PLAYBOOK_CMD, "-i", inv_file, ONBOARD_PLAYBOOK, "--limit", target],
+                    env=env, check=True, capture_output=True, text=True, timeout=ENROLL_TIMEOUT,
+                )
+            except Exception:
+                # Roll back newly staged local escrow files if playbook failed before locking target
+                for sf in staged_files:
+                    try:
+                        os.remove(sf)
+                    except OSError:
+                        pass
+                raise
+
+            persist_allowlisted_target(target)
+            return fingerprint, bg_pub
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def sanitize_reason(raw):
@@ -373,11 +419,12 @@ def audit(action, rec, extra=""):
         f"principal={principal} approver={approver} req_id={rec.get('req_id')} "
         f"reason={json.dumps(rec.get('reason',''))} {extra}\n"
     )
-    try:
-        with open(AUDIT_LOG, "a") as fh:
-            fh.write(line)
-    except OSError as e:
-        log(f"audit write failed: {e}")
+    with _io_lock:
+        try:
+            with open(AUDIT_LOG, "a") as fh:
+                fh.write(line)
+        except OSError as e:
+            log(f"audit write failed: {e}")
 
 
 def ntfy_publish(topic, message, title=None, actions=None, tags=None, priority=None):
@@ -390,34 +437,31 @@ def ntfy_publish(topic, message, title=None, actions=None, tags=None, priority=N
         payload["tags"] = tags
     if priority:
         payload["priority"] = priority
-    data = json.dumps(payload).encode()
+    body = json.dumps(payload).encode()
     req = urlrequest.Request(
-        f"{NTFY_LOCAL}/",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {NTFY_TOKEN}",
-            "Content-Type": "application/json",
-        },
+        NTFY_LOCAL + "/",
+        data=body,
+        headers={"Authorization": f"Bearer {NTFY_TOKEN}",
+                 "Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urlrequest.urlopen(req, timeout=10) as resp:
-            resp.read()
+        urlrequest.urlopen(req, timeout=10).read()
     except (HTTPError, URLError) as e:
-        log(f"ntfy publish to {topic} failed: {e}")
+        log(f"publish to {topic} failed: {e}")
 
 
-def validate_duration(raw):
-    if not isinstance(raw, str):
+def validate_duration(d):
+    if not isinstance(d, str):
         return None
-    m = DURATION_RE.match(raw.strip())
+    m = DURATION_RE.match(d)
     if not m:
         return None
-    val, unit = int(m.group(1)), m.group(2)
-    minutes = val if unit == "m" else val * 60
-    if minutes <= 0 or minutes > MAX_DURATION_MIN:
+    n, unit = int(m.group(1)), m.group(2)
+    minutes = n * 60 if unit == "h" else n
+    if minutes < 1 or minutes > MAX_DURATION_MIN:
         return None
-    return raw.strip()
+    return d
 
 
 def validate_pubkey(pk):
@@ -435,6 +479,7 @@ def sign_cert(pubkey_text, duration, target=None, approver=None, stamp_approver=
     """Sign pubkey_text for `duration` scoped to `target`; return (cert_text, valid_str)."""
     principal = target_principal(target)
     tmpdir = tempfile.mkdtemp(prefix="airlock-sign-", dir="/tmp")
+    os.chmod(tmpdir, 0o700)
     keyfile = os.path.join(tmpdir, "k.pub")
     certfile = os.path.join(tmpdir, "k-cert.pub")
     try:
@@ -469,23 +514,19 @@ def sign_cert(pubkey_text, duration, target=None, approver=None, stamp_approver=
             pass
         return cert_text, valid
     finally:
-        for f in (keyfile, certfile):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-        try:
-            os.rmdir(tmpdir)
-        except OSError:
-            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def reap_expired():
     now = time.time()
+    expired_records = []
     with _lock:
         dead = [t for t, v in _pending.items() if v["expiry"] < now]
         for t in dead:
-            del _pending[t]
+            expired_records.append(_pending.pop(t)["record"])
+    for rec in expired_records:
+        audit("EXPIRE", rec)
+        log(f"expired req_id={rec.get('req_id')} target={rec.get('target')}")
 
 
 # ---- webhook ----------------------------------------------------------------
@@ -543,10 +584,10 @@ class Handler(BaseHTTPRequestHandler):
         if rec.get("action") == "enroll":
             try:
                 fingerprint, _ = enroll_target(rec)
-            except (subprocess.CalledProcessError, RuntimeError, OSError) as e:
-                err_detail = getattr(e, "stderr", None) or str(e)
-                log(f"enroll failed for {target!r}: {err_detail.strip()}")
-                audit("ENROLL_FAIL", rec, extra=f"err={json.dumps(err_detail.strip()[:160])}")
+            except (subprocess.SubprocessError, RuntimeError, OSError) as e:
+                err_detail = (getattr(e, "stderr", None) or str(e)).strip()
+                log(f"enroll failed for {target!r}: {err_detail}")
+                audit("ENROLL_FAIL", rec, extra=f"err={json.dumps(err_detail[:160])}")
                 ntfy_publish(notify_topic,
                              f"Enrollment FAILED for {target} ({rec.get('target_ip')}) — check airlock logs.",
                              title="Airlock enrollment error", tags=["rotating_light"])
@@ -567,34 +608,35 @@ class Handler(BaseHTTPRequestHandler):
             log(f"enrolled req_id={rec['req_id']} target={target} ip={rec.get('target_ip')} bg_fp={fingerprint}")
             return self._reply(200, "enrolled")
 
-        cur_host = current_hypervisor()
-        if cur_host and target == cur_host:
-            if not can_evacuate():
-                log(f"blocked self-referential sign for current hypervisor {target!r} (no evacuate script)")
-                audit("SIGN_BLOCKED_SELF_HOST", rec, extra=f"hypervisor={json.dumps(cur_host)}")
-                ntfy_publish(notify_topic,
-                             f"Blocked: {target} is currently hosting airlock and no evacuate helper is installed.",
-                             title="Airlock self-protection", tags=["octagonal_sign"])
-                return self._reply(409, "cannot mint cert for current hypervisor without evacuation")
-            try:
-                subprocess.run(
-                    [EVACUATE_CMD, target],
-                    check=True, capture_output=True, text=True, timeout=EVACUATE_TIMEOUT,
-                )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                err = getattr(e, "stderr", "") or str(e)
-                log(f"evacuation from {target!r} failed: {err.strip()}")
-                audit("EVACUATE_FAIL", rec, extra=f"err={json.dumps(err.strip()[:120])}")
-                ntfy_publish(notify_topic,
-                             f"Evacuation from {target} failed; cert NOT minted.",
-                             title="Airlock evacuation failed", tags=["rotating_light"])
-                return self._reply(500, "evacuation failed")
-            new_host = current_hypervisor()
-            if new_host == target:
-                log(f"evacuation script exited 0 but current_hypervisor is still {target!r}")
-                audit("EVACUATE_FAIL", rec, extra='err="still on target hypervisor"')
-                return self._reply(409, "still running on target hypervisor")
-            audit("EVACUATE", rec, extra=f"from={target} to={new_host}")
+        with _evac_lock:
+            cur_host = current_hypervisor()
+            if cur_host and target == cur_host:
+                if not can_evacuate():
+                    log(f"blocked self-referential sign for current hypervisor {target!r} (no evacuate script)")
+                    audit("SIGN_BLOCKED_SELF_HOST", rec, extra=f"hypervisor={json.dumps(cur_host)}")
+                    ntfy_publish(notify_topic,
+                                 f"Blocked: {target} is currently hosting airlock and no evacuate helper is installed.",
+                                 title="Airlock self-protection", tags=["octagonal_sign"])
+                    return self._reply(409, "cannot mint cert for current hypervisor without evacuation")
+                try:
+                    subprocess.run(
+                        [EVACUATE_CMD, target],
+                        check=True, capture_output=True, text=True, timeout=EVACUATE_TIMEOUT,
+                    )
+                except (subprocess.SubprocessError, OSError) as e:
+                    err = (getattr(e, "stderr", None) or str(e)).strip()
+                    log(f"evacuation from {target!r} failed: {err}")
+                    audit("EVACUATE_FAIL", rec, extra=f"err={json.dumps(err[:120])}")
+                    ntfy_publish(notify_topic,
+                                 f"Evacuation from {target} failed; cert NOT minted.",
+                                 title="Airlock evacuation failed", tags=["rotating_light"])
+                    return self._reply(500, "evacuation failed")
+                new_host = current_hypervisor()
+                if new_host == target:
+                    log(f"evacuation script exited 0 but current_hypervisor is still {target!r}")
+                    audit("EVACUATE_FAIL", rec, extra='err="still on target hypervisor"')
+                    return self._reply(409, "still running on target hypervisor")
+                audit("EVACUATE", rec, extra=f"from={target} to={new_host}")
 
         try:
             if rec.get("approver_explicit") or STAMP_APPROVER_PRINCIPAL:
@@ -607,9 +649,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 cert_text, valid = sign_cert(rec["pubkey"], rec["duration"], target)
-        except subprocess.CalledProcessError as e:
-            log(f"sign failed: {e.stderr}")
-            audit("SIGN_FAIL", rec, extra=f"err={e.stderr.strip()!r}")
+        except (subprocess.SubprocessError, OSError) as e:
+            err_detail = (getattr(e, "stderr", None) or str(e)).strip()
+            log(f"sign failed: {err_detail}")
+            audit("SIGN_FAIL", rec, extra=f"err={json.dumps(err_detail[:160])}")
             ntfy_publish(notify_topic,
                          f"Signing FAILED for {target} ({rec['req_id']}) — check airlock logs.",
                          title="Airlock error", tags=["rotating_light"])
@@ -627,6 +670,8 @@ class Handler(BaseHTTPRequestHandler):
                      title="SSH cert issued ✅", tags=["white_check_mark"])
         log(f"signed req_id={rec['req_id']} target={target} {valid}")
         return self._reply(200, "approved")
+
+
 # ---- request subscriber -----------------------------------------------------
 def handle_request(payload):
     try:
@@ -664,6 +709,12 @@ def handle_request(payload):
                          f"Rejected enroll request: invalid hostname {target!r}.",
                          title="Airlock enroll rejected", tags=["no_entry"])
             return
+        if is_target_allowlisted(target) or has_escrowed_break_glass_key(target):
+            log(f"rejecting enroll request for already-enrolled target {target!r}")
+            ntfy_publish(notify_topic,
+                         f"Rejected enroll request: {target} is already enrolled in Airlock.",
+                         title="Airlock enroll rejected", tags=["no_entry"])
+            return
         target_ip = validate_target_ip(rec.get("target_ip"))
         if not target_ip:
             log(f"rejecting enroll request for {target!r} with invalid/non-private IP {rec.get('target_ip')!r}")
@@ -689,8 +740,14 @@ def handle_request(payload):
                          f"OPA precheck blocked enroll request for {target} via approver {approver!r}.",
                          title="Airlock precheck blocked", tags=["shield"])
             return
+        reap_expired()
         token = secrets.token_urlsafe(32)
         with _lock:
+            for existing in _pending.values():
+                er = existing["record"]
+                if er.get("action") == "enroll" and er.get("target") == target:
+                    log(f"rejecting duplicate pending enroll request for {target!r}")
+                    return
             _pending[token] = {"record": enroll_rec, "expiry": time.time() + TOKEN_TTL}
         actions = [
             {"action": "http", "label": "Approve: Enroll & Lock", "url": f"{WEBHOOK_URL}/approve",
@@ -719,7 +776,7 @@ def handle_request(payload):
                      title="Airlock request rejected", tags=["no_entry"])
         return
     if not duration:
-        log(f"rejecting request with bad duration {rec.get('duration')!r}")
+        log(f"rejecting request with invalid duration {rec.get('duration')!r}")
         ntfy_publish(notify_topic,
                      f"Rejected request for {target}: bad duration {rec.get('duration')!r}.",
                      title="Airlock request rejected", tags=["no_entry"])
@@ -783,7 +840,7 @@ def handle_request(payload):
 
 
 def subscribe_loop():
-    url = f"{NTFY_LOCAL}/{TOPIC_REQ}/json"
+    url = f"{NTFY_LOCAL}/{TOPIC_REQ}/json?since=15s"
     while True:
         try:
             req = urlrequest.Request(
@@ -800,6 +857,12 @@ def subscribe_loop():
                     except json.JSONDecodeError:
                         continue
                     if ev.get("event") == "message":
+                        msg_id = ev.get("id")
+                        if msg_id:
+                            with _lock:
+                                if msg_id in _seen_req_ids:
+                                    continue
+                                _seen_req_ids.append(msg_id)
                         handle_request(ev.get("message", ""))
         except (HTTPError, URLError, TimeoutError, OSError) as e:
             log(f"subscribe reconnect after: {e}")
@@ -809,13 +872,7 @@ def subscribe_loop():
 def reaper_loop():
     while True:
         time.sleep(30)
-        now = time.time()
-        with _lock:
-            expired = [t for t, v in _pending.items() if v["expiry"] < now]
-            for t in expired:
-                rec = _pending.pop(t)["record"]
-                audit("EXPIRE", rec)
-                log(f"expired req_id={rec.get('req_id')} target={rec.get('target')}")
+        reap_expired()
 
 
 def main():

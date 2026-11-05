@@ -1,13 +1,24 @@
 ---
 all:
   children:
+    airlock_servers:
+      hosts:
+        airlock:
+          ansible_host: 10.6.19.1
+          airlock_ntfy_approver_token: "tk_replace_with_ntfy_approver_token"
+          airlock_principal_user: "airlock-admin"
+          airlock_precheck_mode: "boundary_only"   # or "silent_precheck" with airlock_opa_precheck_url
+          airlock_hypervisor_guard_enabled: false
     airlock_targets:
       vars:
         airlock_principal_user: "airlock-admin"
-        # Paste contents of /etc/airlock/certs/ssh_user_ca_key.pub from CA_HOST:
+        # Paste contents of /etc/airlock/certs/ssh_user_ca_key.pub from the Airlock server:
         airlock_user_ca_pubkey: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABB... step-ca-user-ca"
+        airlock_include_generic_principal: true
+        airlock_allowed_approvers: []
         airlock_manage_authorized_keys: false
         airlock_hypervisor_guard_enabled: false
+        airlock_purge_birth_pubkey: ""
       hosts:
         target-host-1:
           ansible_host: 10.0.0.20

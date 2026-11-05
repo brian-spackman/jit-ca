@@ -7,6 +7,19 @@
       - (airlock_user_ca_pubkey | trim).startswith(('ecdsa-', 'ssh-ed25519', 'ssh-rsa', 'sk-'))
     fail_msg: "airlock_user_ca_pubkey must be set to the contents of certs/ssh_user_ca_key.pub from the Airlock host."
 
+- name: Validate non-empty principals configuration
+  ansible.builtin.assert:
+    that:
+      - (airlock_include_generic_principal | bool) or ((airlock_allowed_approvers | default([])) | length > 0)
+    fail_msg: "Either airlock_include_generic_principal must be true or airlock_allowed_approvers must be non-empty."
+
+- name: Validate non-empty break-glass key when airlock_manage_authorized_keys is enabled
+  ansible.builtin.assert:
+    that:
+      - (airlock_break_glass_pubkey is string and (airlock_break_glass_pubkey | trim | length > 0)) or ((airlock_extra_authorized_keys | default([])) | length > 0)
+    fail_msg: "When airlock_manage_authorized_keys is true, airlock_break_glass_pubkey or airlock_extra_authorized_keys must provide at least one SSH public key."
+  when: airlock_manage_authorized_keys | bool
+
 - name: Ensure principal group exists when explicit UID/GID is requested
   ansible.builtin.group:
     name: "{{ airlock_principal_user }}"
@@ -25,6 +38,7 @@
     create_home: true
     password_lock: true
     state: present
+  register: _airlock_principal_user_res
 
 - name: Configure passwordless sudo for Airlock principal user
   ansible.builtin.copy:
@@ -83,18 +97,22 @@
   changed_when: false
   check_mode: false
 
+- name: Compute principal user home directory
+  ansible.builtin.set_fact:
+    _airlock_principal_home: "{{ _airlock_principal_user_res.home | default('/root' if airlock_principal_user == 'root' else '/home/' ~ airlock_principal_user) }}"
+
 - name: Ensure ~/.ssh directory exists for principal user
   ansible.builtin.file:
-    path: "/home/{{ airlock_principal_user }}/.ssh"
+    path: "{{ _airlock_principal_home }}/.ssh"
     state: directory
-    owner: "{{ airlock_principal_user }}"
-    group: "{{ airlock_principal_user }}"
+    owner: "{{ omit if (ansible_check_mode and (_airlock_principal_user_res.changed | default(false))) else airlock_principal_user }}"
+    group: "{{ omit if (ansible_check_mode and (_airlock_principal_user_res.changed | default(false))) else airlock_principal_user }}"
     mode: "0700"
   when: airlock_manage_authorized_keys | bool
 
 - name: Configure ~/.ssh/authorized_keys (break-glass key + any explicit extra keys only)
   ansible.builtin.copy:
-    dest: "/home/{{ airlock_principal_user }}/.ssh/authorized_keys"
+    dest: "{{ _airlock_principal_home }}/.ssh/authorized_keys"
     content: |
       {% if airlock_break_glass_pubkey is string and (airlock_break_glass_pubkey | trim | length > 0) %}
       {{ airlock_break_glass_pubkey | trim }}
@@ -104,10 +122,10 @@
       {{ key | trim }}
       {% endfor %}
       {% endif %}
-    owner: "{{ airlock_principal_user }}"
-    group: "{{ airlock_principal_user }}"
+    owner: "{{ omit if (ansible_check_mode and (_airlock_principal_user_res.changed | default(false))) else airlock_principal_user }}"
+    group: "{{ omit if (ansible_check_mode and (_airlock_principal_user_res.changed | default(false))) else airlock_principal_user }}"
     mode: "0600"
-    backup: true
+    backup: false
   when: airlock_manage_authorized_keys | bool
 
 - name: Install optional Proxmox hypervisor host-identity hookscript (when enabled)
@@ -129,12 +147,13 @@
         mode: "0755"
   when: airlock_hypervisor_guard_enabled | bool
 
-- name: Scrub Day-0 birth public key from /root/.ssh/authorized_keys (when present)
+- name: Scrub Day-0 birth public key from bootstrap authorized_keys (when present)
   ansible.builtin.lineinfile:
-    path: /root/.ssh/authorized_keys
-    line: "{{ airlock_purge_birth_pubkey | trim }}"
+    path: "{{ item }}"
+    regexp: "{{ ((airlock_purge_birth_pubkey | trim).split()[:2] | map('regex_escape') | join('\\s+')) }}"
     state: absent
+  loop: "{{ ['/root/.ssh/authorized_keys'] + (['/home/' ~ ansible_user ~ '/.ssh/authorized_keys'] if (ansible_user is defined and ansible_user != 'root' and ansible_user != airlock_principal_user) else []) }}"
   when:
     - airlock_purge_birth_pubkey is string
-    - airlock_purge_birth_pubkey | trim | length > 0
+    - (airlock_purge_birth_pubkey | trim).split() | length >= 2
   failed_when: false

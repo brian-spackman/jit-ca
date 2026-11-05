@@ -110,8 +110,11 @@ def main():
                 continue
             if body.get("req_id") != req_id or not body.get("cert"):
                 continue
-            CERT.write_text(body["cert"].strip() + "\n")
-            os.chmod(CERT, 0o644)
+            CERT.parent.mkdir(parents=True, exist_ok=True)
+            tmp_cert = CERT.with_suffix(".pub.tmp")
+            tmp_cert.write_text(body["cert"].strip() + "\n")
+            os.chmod(tmp_cert, 0o644)
+            os.replace(tmp_cert, CERT)
             out = subprocess.run(["ssh-keygen", "-L", "-f", str(CERT)],
                                  capture_output=True, text=True).stdout
             valid = next((l.strip() for l in out.splitlines()

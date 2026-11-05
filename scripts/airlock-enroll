@@ -7,7 +7,7 @@ and Airlock completes running `onboard-target.yml` using its private birth key
 (generating & escrowing a per-target break-glass key, installing CA trust +
 per-target principal, and wiping the birth key from the target).
 
-  usage: airlock-enroll <target-hostname> <target-ip> <reason>
+  usage: airlock-enroll <target-hostname> <target-ip> <reason> [approver]
   e.g.:  airlock-enroll transcribe 10.6.31.1 "Onboard newly created transcribe LXC 3101"
 """
 
@@ -27,6 +27,7 @@ TOPIC_CERT = "airlock-certs"
 TOKEN_FILE = Path.home() / ".config/airlock/ntfy-agent-token"
 TIMEOUT = 300
 TARGET_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+APPROVER_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
 
 
 def die(msg, code=1):
@@ -35,9 +36,12 @@ def die(msg, code=1):
 
 
 def main():
-    if len(sys.argv) != 4:
-        die("usage: airlock-enroll <target-hostname> <target-ip> <reason>")
+    if len(sys.argv) not in (4, 5):
+        die("usage: airlock-enroll <target-hostname> <target-ip> <reason> [approver]")
     target, target_ip, reason = sys.argv[1].strip(), sys.argv[2].strip(), sys.argv[3]
+    approver = sys.argv[4].strip() if len(sys.argv) == 5 else None
+    if approver is not None and not APPROVER_NAME_RE.match(approver):
+        die(f"invalid approver name: {approver!r}")
     if not TARGET_NAME_RE.match(target):
         die(f"invalid target hostname: {target!r}")
     try:
@@ -52,13 +56,16 @@ def main():
     token = TOKEN_FILE.read_text().strip()
     req_id = secrets.token_hex(8)
 
-    request_json = json.dumps({
+    req_obj = {
         "action": "enroll",
         "req_id": req_id,
         "target": target,
         "target_ip": str(ip_obj),
         "reason": reason,
-    })
+    }
+    if approver:
+        req_obj["approver"] = approver
+    request_json = json.dumps(req_obj)
     payload = json.dumps({"topic": TOPIC_REQ, "message": request_json}).encode()
     req = urlrequest.Request(
         f"{NTFY}/", data=payload,

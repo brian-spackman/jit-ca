@@ -3,13 +3,15 @@
 # Invoked by Proxmox qemu-guest-agent hookscript on boot and post-migration.
 set -euo pipefail
 
-HOST_NODE="${1:-}"
-if [[ -z "$HOST_NODE" || ! "$HOST_NODE" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+RAW_HOST="${1:-}"
+HOST_NODE="${RAW_HOST,,}"
+if [[ -z "$HOST_NODE" || ! "$HOST_NODE" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then
     echo "Usage: airlock-set-host <hypervisor-hostname>" >&2
     exit 1
 fi
 
 install -d -m 0755 -o root -g root /run/airlock
-printf '%s\n' "$HOST_NODE" > /run/airlock/current-hypervisor.tmp
-chmod 0444 /run/airlock/current-hypervisor.tmp
-mv -f /run/airlock/current-hypervisor.tmp /run/airlock/current-hypervisor
+TMP_FILE="$(mktemp /run/airlock/current-hypervisor.XXXXXX)"
+printf '%s\n' "$HOST_NODE" > "$TMP_FILE"
+chmod 0444 "$TMP_FILE"
+mv -f "$TMP_FILE" /run/airlock/current-hypervisor

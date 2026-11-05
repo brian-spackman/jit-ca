@@ -297,10 +297,10 @@ airlock-request target-host 1h "upgrade the app container to v2.0"
 
 What it does:
 
-1. Ensures an agent keypair exists at `~/.ssh/airlock-ca/agent_key` (generates an ed25519 key on first run).
+1. Ensures an agent keypair exists at `~/.ssh/airlock/agent_key` (generates an ed25519 key on first run).
 2. Publishes `{req_id, target, duration, reason, pubkey}` to `airlock-requests` using the agent's ntfy token, then **blocks**, printing *"waiting for approval — tap Approve on your phone"*.
 3. Polls `airlock-certs` (with a short lookback window — ntfy's 12h cache makes this reliable), filtering by its own `req_id` so a stale cert from a prior request is ignored.
-4. On match, writes the cert to `~/.ssh/airlock-ca/agent_key-cert.pub` and prints the validity window. Times out after ~5 minutes if no approval arrives.
+4. On match, writes the cert to `~/.ssh/airlock/agent_key-cert.pub` and prints the validity window. Times out after ~5 minutes if no approval arrives.
 
 Wire it into the agent's `~/.ssh/config` so plain `ssh target-host` uses the cert and fails cleanly when there's no valid one:
 
@@ -308,8 +308,8 @@ Wire it into the agent's `~/.ssh/config` so plain `ssh target-host` uses the cer
 Host target-host
   HostName 10.0.0.20
   User agent
-  IdentityFile ~/.ssh/airlock-ca/agent_key
-  CertificateFile ~/.ssh/airlock-ca/agent_key-cert.pub
+  IdentityFile ~/.ssh/airlock/agent_key
+  CertificateFile ~/.ssh/airlock/agent_key-cert.pub
   IdentitiesOnly yes
 ```
 
@@ -361,7 +361,7 @@ That's it — targets need **no** ntfy, no webhook, no extra firewall rules (onl
 
 ```bash
 airlock-request target-host 30m "onboarding test"     # tap Approve on your phone
-ssh-keygen -L -f ~/.ssh/airlock-ca/agent_key-cert.pub  # Principals: agent@target-host ; ~30m window
+ssh-keygen -L -f ~/.ssh/airlock/agent_key-cert.pub  # Principals: agent@target-host ; ~30m window
 ssh target-host 'id'                               # logs in as agent
 # wait out the TTL → ssh target-host now fails: cert is the only path, and it expired
 ```

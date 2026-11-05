@@ -1,0 +1,16 @@
+---
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart step-ca
+  ansible.builtin.systemd:
+    name: step-ca
+    state: restarted
+    enabled: true
+
+- name: Restart airlock-approver
+  ansible.builtin.systemd:
+    name: airlock-approver
+    state: restarted
+    enabled: true

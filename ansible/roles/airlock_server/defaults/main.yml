@@ -1,0 +1,50 @@
+---
+# Default variables for airlock_server role (VM 1901 / 10.6.19.1)
+
+airlock_host_ip: "{{ ansible_host | default('10.6.19.1') }}"
+airlock_webhook_port: 8081
+airlock_ntfy_port: 8080
+airlock_ntfy_base_url: "http://{{ airlock_host_ip }}:{{ airlock_ntfy_port }}"
+airlock_ntfy_approver_token: "tk_replace_with_ntfy_approver_token"
+airlock_ca_url: "https://localhost:9000"
+airlock_ca_name: "Airlock SSH CA"
+airlock_ca_dns: "localhost"
+airlock_ca_address: "127.0.0.1:9000"
+airlock_provisioner_name: "airlock-ssh"
+airlock_principal_user: "airlock-admin"
+
+# Subnets permitted by UFW to reach SSH (22), ntfy (8080), and approve webhook (8081)
+airlock_lan_subnet: "10.6.0.0/16"
+airlock_vpn_subnet: "10.5.0.0/24"
+airlock_extra_allowed_subnets: []
+
+# Topics & multi-approver configuration
+airlock_topic_req: "airlock-requests"
+airlock_topic_approve: "airlock-approvals"
+airlock_topic_cert: "airlock-certs"
+airlock_default_approver: "brian"
+airlock_per_approver_topics: false
+airlock_stamp_approver_principal: false
+airlock_precheck_mode: "boundary_only"      # "boundary_only" | "silent_precheck"
+airlock_opa_precheck_url: ""                # e.g. "http://10.6.30.1:8601/v1/airlock/precheck"
+
+# Initial static target allowlist (Day-0 enrollments also append to /etc/airlock/target-allowlist.txt)
+airlock_initial_targets:
+  - "target-host-1"
+  - "target-host-2"
+
+# Day-0 Tap-to-Enroll settings on the Airlock server
+airlock_bootstrap_user: "root"
+airlock_break_glass_escrow_cmd: ""
+
+# Optional Proxmox hypervisor self-reference guard & auto-evacuation inside the Airlock VM
+airlock_hypervisor_guard_enabled: false
+airlock_pve_vmid: "1901"
+airlock_pve_peer_map: "optimuxprime:metroplex,metroplex:optimuxprime"
+airlock_pve_api_urls: {}
+# e.g.:
+#   optimuxprime: "https://10.6.1.2:8006"
+#   metroplex: "https://10.6.1.1:8006"
+airlock_pve_api_token: ""
+airlock_pve_cacert: ""
+airlock_pve_tls_insecure: false

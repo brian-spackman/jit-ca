@@ -17,6 +17,7 @@ Runs on the CA host as the `step` user. Two jobs in one process:
 See REPLICATION-GUIDE.md (Section 5) for the design rationale.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -66,6 +67,18 @@ TARGET_ALLOWLIST = {"target-host-1", "target-host-2"}
 CURRENT_HOST_FILE = "/run/jit-ca/current-hypervisor"
 EVACUATE_CMD = "/usr/local/libexec/jit-ca-evacuate"
 EVACUATE_TIMEOUT = 120
+
+# Day-0 Tap-to-Enroll settings (airlock-enroll / action="enroll"):
+ALLOWLIST_FILE = "/etc/jit-ca/target-allowlist.txt"
+USER_CA_PUBKEY_FILE = "/etc/jit-ca/certs/ssh_user_ca_key.pub"
+BIRTH_KEY_FILE = "/etc/jit-ca/secrets/birth_key"
+BOOTSTRAP_USER = "root"
+ANSIBLE_PLAYBOOK_CMD = "/usr/bin/ansible-playbook"
+ONBOARD_PLAYBOOK = "/etc/jit-ca/ansible/onboard-target.yml"
+BREAK_GLASS_ESCROW_DIR = "/etc/jit-ca/secrets/break-glass"
+BREAK_GLASS_ESCROW_CMD = ""                 # optional Vaultwarden/Bitwarden/1Password CLI hook
+ENROLL_TIMEOUT = 120
+TARGET_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DURATION_RE = re.compile(r"^(\d+)([mh])$")
 REQ_ID_RE = re.compile(r"^[0-9a-f]{16,64}$")
 CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]+")
@@ -101,6 +114,182 @@ def current_hypervisor():
 
 def can_evacuate():
     return bool(EVACUATE_CMD and os.path.isfile(EVACUATE_CMD) and os.access(EVACUATE_CMD, os.X_OK))
+
+
+def is_target_allowlisted(target):
+    if target in TARGET_ALLOWLIST:
+        return True
+    if ALLOWLIST_FILE and os.path.isfile(ALLOWLIST_FILE):
+        try:
+            with open(ALLOWLIST_FILE) as fh:
+                for line in fh:
+                    item = line.split("#", 1)[0].strip()
+                    if item:
+                        TARGET_ALLOWLIST.add(item)
+        except OSError:
+            pass
+    return target in TARGET_ALLOWLIST
+
+
+def persist_allowlisted_target(target):
+    TARGET_ALLOWLIST.add(target)
+    if not ALLOWLIST_FILE:
+        return
+    try:
+        parent = os.path.dirname(ALLOWLIST_FILE)
+        if parent and os.path.isdir(parent):
+            existing = set()
+            if os.path.isfile(ALLOWLIST_FILE):
+                with open(ALLOWLIST_FILE) as fh:
+                    existing = {ln.split("#", 1)[0].strip() for ln in fh if ln.strip()}
+            if target not in existing:
+                with open(ALLOWLIST_FILE, "a") as fh:
+                    fh.write(f"{target}\n")
+    except OSError as e:
+        log(f"warning: could not persist {target} to {ALLOWLIST_FILE}: {e}")
+
+
+def validate_target_ip(raw_ip):
+    if not isinstance(raw_ip, str) or not raw_ip.strip():
+        return None
+    try:
+        ip_obj = ipaddress.ip_address(raw_ip.strip())
+    except ValueError:
+        return None
+    if (
+        not ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_multicast
+        or ip_obj.is_link_local
+        or ip_obj.is_unspecified
+    ):
+        return None
+    return str(ip_obj)
+
+
+def enroll_target(rec):
+    """Day-0 target enrollment:
+    1. Generate fresh ed25519 break-glass keypair in a 0700 tempdir.
+    2. Escrow private break-glass key (fail-closed if escrow fails!).
+    3. Run ansible-playbook onboard-target.yml using BIRTH_KEY_FILE, installing CA trust,
+       per-target principal, and replacing authorized_keys with ONLY break-glass.pub.
+    4. Add target to TARGET_ALLOWLIST and return (bg_fingerprint, bg_pub).
+    """
+    target = rec["target"]
+    target_ip = rec["target_ip"]
+    if not USER_CA_PUBKEY_FILE or not os.path.isfile(USER_CA_PUBKEY_FILE):
+        raise RuntimeError(f"missing USER_CA_PUBKEY_FILE at {USER_CA_PUBKEY_FILE}")
+    if not BIRTH_KEY_FILE or not os.path.isfile(BIRTH_KEY_FILE):
+        raise RuntimeError(f"missing BIRTH_KEY_FILE at {BIRTH_KEY_FILE}")
+    if not ONBOARD_PLAYBOOK or not os.path.isfile(ONBOARD_PLAYBOOK):
+        raise RuntimeError(f"missing ONBOARD_PLAYBOOK at {ONBOARD_PLAYBOOK}")
+
+    with open(USER_CA_PUBKEY_FILE) as fh:
+        ca_pubkey = fh.read().strip()
+    birth_pubkey = ""
+    if os.path.isfile(BIRTH_KEY_FILE + ".pub"):
+        try:
+            with open(BIRTH_KEY_FILE + ".pub") as fh:
+                birth_pubkey = fh.read().strip()
+        except OSError:
+            pass
+
+    tmpdir = tempfile.mkdtemp(prefix="jit-enroll-")
+    os.chmod(tmpdir, 0o700)
+    bg_key = os.path.join(tmpdir, "bg_key")
+    bg_pub_file = bg_key + ".pub"
+    inv_file = os.path.join(tmpdir, "inventory.json")
+    try:
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+             "-C", f"{target}-break-glass", "-f", bg_key],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        with open(bg_key) as fh:
+            bg_priv = fh.read()
+        with open(bg_pub_file) as fh:
+            bg_pub = fh.read().strip()
+
+        fp_out = subprocess.run(
+            ["ssh-keygen", "-lf", bg_pub_file],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        fingerprint = fp_out.split()[1] if len(fp_out.split()) >= 2 else fp_out
+
+        # Step 2: Fail-closed escrow of break-glass private key BEFORE touching target
+        escrowed = False
+        if BREAK_GLASS_ESCROW_CMD:
+            subprocess.run(
+                [BREAK_GLASS_ESCROW_CMD, target, target_ip],
+                input=bg_priv, check=True, capture_output=True, text=True, timeout=30,
+            )
+            escrowed = True
+        if BREAK_GLASS_ESCROW_DIR:
+            os.makedirs(BREAK_GLASS_ESCROW_DIR, mode=0o700, exist_ok=True)
+            priv_dest = os.path.join(BREAK_GLASS_ESCROW_DIR, f"{target}.id_ed25519")
+            pub_dest = os.path.join(BREAK_GLASS_ESCROW_DIR, f"{target}.id_ed25519.pub")
+            fd = os.open(priv_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(bg_priv)
+            with open(pub_dest, "w") as fh:
+                fh.write(bg_pub + "\n")
+            os.chmod(pub_dest, 0o644)
+            escrowed = True
+        if not escrowed:
+            raise RuntimeError("no break-glass escrow destination configured")
+
+        # Step 3: Write single-host JSON/YAML inventory & run onboard-target.yml over birth_key
+        host_vars = {
+            "ansible_host": target_ip,
+            "ansible_user": BOOTSTRAP_USER,
+            "ansible_ssh_private_key_file": BIRTH_KEY_FILE,
+            "ansible_ssh_common_args": "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+            "jit_ca_target_name": target,
+            "jit_ca_principal_user": PRINCIPAL,
+            "jit_ca_user_ca_pubkey": ca_pubkey,
+            "jit_ca_manage_authorized_keys": True,
+            "jit_ca_break_glass_pubkey": bg_pub,
+            "jit_ca_extra_authorized_keys": rec.get("extra_authorized_keys") or [],
+            "jit_ca_purge_birth_pubkey": birth_pubkey,
+        }
+        if rec.get("principal_uid") is not None:
+            host_vars["jit_ca_principal_uid"] = int(rec["principal_uid"])
+        if rec.get("principals_dir"):
+            host_vars["jit_ca_principals_dir"] = str(rec["principals_dir"])
+        if rec.get("sshd_dropin_path"):
+            host_vars["jit_ca_sshd_dropin_path"] = str(rec["sshd_dropin_path"])
+
+        inv_data = {
+            "all": {
+                "children": {
+                    "jit_ca_targets": {
+                        "hosts": {
+                            target: host_vars,
+                        }
+                    }
+                }
+            }
+        }
+        with open(inv_file, "w") as fh:
+            json.dump(inv_data, fh, indent=2)
+
+        env = dict(os.environ, ANSIBLE_HOST_KEY_CHECKING="False", ANSIBLE_RETRY_FILES_ENABLED="False")
+        subprocess.run(
+            [ANSIBLE_PLAYBOOK_CMD, "-i", inv_file, ONBOARD_PLAYBOOK, "--limit", target],
+            env=env, check=True, capture_output=True, text=True, timeout=ENROLL_TIMEOUT,
+        )
+        persist_allowlisted_target(target)
+        return fingerprint, bg_pub
+    finally:
+        for f in (bg_key, bg_pub_file, inv_file):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
 
 
 def sanitize_reason(raw):
@@ -292,6 +481,32 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply(409, "still on target hypervisor")
             audit("EVACUATE", rec, extra=f"from={json.dumps(cur_host)} to={json.dumps(post_host)}")
 
+        if rec.get("action") == "enroll":
+            try:
+                fingerprint, _ = enroll_target(rec)
+            except (subprocess.SubprocessError, RuntimeError, OSError) as e:
+                err_msg = getattr(e, "stderr", "") or getattr(e, "stdout", "") or str(e)
+                log(f"enroll failed for {target!r}: {err_msg}")
+                audit("ENROLL_FAIL", rec, extra=f"ip={json.dumps(rec.get('target_ip'))} err={json.dumps(err_msg[:200])}")
+                ntfy_publish(TOPIC_APPROVE,
+                             f"Enrollment FAILED for {target} ({rec.get('target_ip')}) — check airlock logs.",
+                             title="Airlock enrollment error", tags=["rotating_light"])
+                return self._reply(500, "enroll failed")
+
+            ntfy_publish(TOPIC_CERT, json.dumps({
+                "req_id": rec["req_id"],
+                "enrolled": True,
+                "target": target,
+                "target_ip": rec.get("target_ip"),
+                "fingerprint": fingerprint,
+            }))
+            audit("ENROLL", rec, extra=f"ip={json.dumps(rec.get('target_ip'))} bg_fp={json.dumps(fingerprint)}")
+            ntfy_publish(TOPIC_APPROVE,
+                         f"Enrolled & locked: {target} ({rec.get('target_ip')}). Break-glass: {fingerprint}",
+                         title="Target enrolled in Airlock ✅", tags=["white_check_mark"])
+            log(f"enrolled req_id={rec['req_id']} target={target} ip={rec.get('target_ip')} bg_fp={fingerprint}")
+            return self._reply(200, "enrolled")
+
         try:
             cert_text, valid = sign_cert(rec["pubkey"], rec["duration"], target)
         except subprocess.CalledProcessError as e:
@@ -330,12 +545,57 @@ def handle_request(payload):
         log(f"rejecting request with missing/malformed req_id {req_id!r}")
         return
 
+    action = rec.get("action", "sign")
     target = rec.get("target")
     raw_reason = rec.get("reason", "")
+
+    if action == "enroll":
+        if not isinstance(target, str) or not TARGET_NAME_RE.match(target):
+            log(f"rejecting enroll request with invalid target hostname {target!r}")
+            ntfy_publish(TOPIC_APPROVE,
+                         f"Rejected enroll request: invalid hostname {target!r}.",
+                         title="Airlock enroll rejected", tags=["no_entry"])
+            return
+        target_ip = validate_target_ip(rec.get("target_ip"))
+        if not target_ip:
+            log(f"rejecting enroll request for {target!r} with invalid/non-private IP {rec.get('target_ip')!r}")
+            ntfy_publish(TOPIC_APPROVE,
+                         f"Rejected enroll request for {target}: invalid/non-private IP {rec.get('target_ip')!r}.",
+                         title="Airlock enroll rejected", tags=["no_entry"])
+            return
+        reason = sanitize_reason(raw_reason)
+        enroll_rec = {
+            "action": "enroll",
+            "req_id": req_id,
+            "target": target,
+            "target_ip": target_ip,
+            "duration": "enroll",
+            "reason": reason,
+        }
+        token = secrets.token_urlsafe(32)
+        with _lock:
+            _pending[token] = {"record": enroll_rec, "expiry": time.time() + TOKEN_TTL}
+        actions = [
+            {"action": "http", "label": "Approve: Enroll & Lock", "url": f"{WEBHOOK_URL}/approve",
+             "method": "POST", "body": token, "clear": True},
+            {"action": "http", "label": "Deny", "url": f"{WEBHOOK_URL}/deny",
+             "method": "POST", "body": token, "clear": True},
+        ]
+        ntfy_publish(
+            TOPIC_APPROVE,
+            f"Enroll {target} ({target_ip}): {reason}",
+            title="Enroll new target in Airlock?",
+            actions=actions,
+            priority=5,
+            tags=["key"],
+        )
+        log(f"enroll request req_id={req_id} target={target} ip={target_ip} -> approval sent")
+        return
+
     pubkey = rec.get("pubkey", "")
     duration = validate_duration(rec.get("duration"))
 
-    if not isinstance(target, str) or target not in TARGET_ALLOWLIST:
+    if not isinstance(target, str) or not is_target_allowlisted(target):
         log(f"rejecting request for non-allowlisted target {target!r}")
         ntfy_publish(TOPIC_APPROVE,
                      f"Rejected request: unknown target {target!r}.",

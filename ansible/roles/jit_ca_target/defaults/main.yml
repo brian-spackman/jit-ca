@@ -34,3 +34,7 @@ jit_ca_extra_authorized_keys: []
 # (Disabled by default; enable only on Proxmox hypervisors that host the jit-ca VM).
 jit_ca_hypervisor_guard_enabled: false
 jit_ca_proxmox_snippets_dir: "/var/lib/vz/snippets"
+
+# Optional birth public key to scrub from /root/.ssh/authorized_keys at the end
+# of Day-0 enrollment (in case root was used as the bootstrap SSH user).
+jit_ca_purge_birth_pubkey: ""

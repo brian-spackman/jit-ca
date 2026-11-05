@@ -813,5 +813,142 @@ class TestNewReviewFixes(unittest.TestCase):
             self.assertTrue(os.access(p, os.X_OK), f"{p} is not executable")
 
 
+    def test_jit08_enroll_request_validation_and_approval_flow(self):
+        """JIT-08a: Day-0 enroll validates hostname/private IP, escrows break-glass key, runs playbook, and updates allowlist."""
+        # 1. Invalid hostname and non-private IPs must be rejected
+        for bad_target, bad_ip in [
+            ("bad host!", "10.6.31.1"),
+            ("-leading-dash", "10.6.31.1"),
+            ("transcribe", "8.8.8.8"),
+            ("transcribe", "127.0.0.1"),
+            ("transcribe", "not-an-ip"),
+        ]:
+            self.approver.handle_request(json.dumps({
+                "action": "enroll",
+                "req_id": SAMPLE_REQ_ID,
+                "target": bad_target,
+                "target_ip": bad_ip,
+                "reason": "test bad enroll",
+            }))
+            self.assertEqual(len(self.approver._pending), 0)
+
+        # 2. Configure temp files for USER_CA_PUBKEY_FILE, BIRTH_KEY_FILE, ONBOARD_PLAYBOOK, BREAK_GLASS_ESCROW_DIR, ALLOWLIST_FILE
+        ca_pub = Path(self.tmpdir.name) / "user_ca.pub"
+        ca_pub.write_text(SAMPLE_PUBKEY + "\n")
+        birth_key = Path(self.tmpdir.name) / "birth_key"
+        birth_key.write_text("PRIVATE_BIRTH_KEY\n")
+        birth_pub = Path(self.tmpdir.name) / "birth_key.pub"
+        birth_pub.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBirthKeyTest airlock-birth-key\n")
+        playbook = Path(self.tmpdir.name) / "onboard-target.yml"
+        playbook.write_text("---\n- hosts: jit_ca_targets\n")
+        escrow_dir = Path(self.tmpdir.name) / "escrow"
+        allowlist_file = Path(self.tmpdir.name) / "target-allowlist"
+
+        self.approver.USER_CA_PUBKEY_FILE = str(ca_pub)
+        self.approver.BIRTH_KEY_FILE = str(birth_key)
+        self.approver.ONBOARD_PLAYBOOK = str(playbook)
+        self.approver.BREAK_GLASS_ESCROW_DIR = str(escrow_dir)
+        self.approver.ALLOWLIST_FILE = str(allowlist_file)
+
+        # Confirm 'transcribe' is not yet allowlisted
+        self.assertFalse(self.approver.is_target_allowlisted("transcribe"))
+
+        self.approver.handle_request(json.dumps({
+            "action": "enroll",
+            "req_id": SAMPLE_REQ_ID,
+            "target": "transcribe",
+            "target_ip": "10.6.31.1",
+            "reason": "Onboard new transcribe LXC 3101",
+        }))
+        self.assertEqual(len(self.approver._pending), 1)
+        self.assertEqual(self.published[-1]["actions"][0]["label"], "Approve: Enroll & Lock")
+        token = next(iter(self.approver._pending.keys()))
+
+        captured_inventory = {}
+        real_run = subprocess.run
+
+        def fake_enroll_run(cmd, *a, **kw):
+            if cmd[0] == "ssh-keygen":
+                return real_run(cmd, *a, **kw)
+            if cmd[0] == self.approver.ANSIBLE_PLAYBOOK_CMD:
+                inv_path = cmd[cmd.index("-i") + 1]
+                captured_inventory.update(json.loads(Path(inv_path).read_text()))
+                return subprocess.CompletedProcess(cmd, 0, stdout="PLAY RECAP ok=8", stderr="")
+            raise AssertionError(f"Unexpected subprocess cmd: {cmd}")
+
+        with mock.patch.object(self.approver.subprocess, "run", side_effect=fake_enroll_run):
+            code, body = self._invoke_post("/approve", token)
+
+        self.assertEqual(code, 200)
+        self.assertEqual(body, "enrolled")
+
+        # Verify break-glass private key was escrowed with 0600 permissions
+        escrowed_priv = escrow_dir / "transcribe.id_ed25519"
+        escrowed_pub = escrow_dir / "transcribe.id_ed25519.pub"
+        self.assertTrue(escrowed_priv.is_file())
+        self.assertTrue(escrowed_pub.is_file())
+        self.assertEqual(escrowed_priv.stat().st_mode & 0o777, 0o600)
+
+        # Verify inventory passed to ansible-playbook had birth key + break-glass pubkey + purge_birth_pubkey
+        host_vars = captured_inventory["all"]["children"]["jit_ca_targets"]["hosts"]["transcribe"]
+        self.assertEqual(host_vars["ansible_host"], "10.6.31.1")
+        self.assertEqual(host_vars["ansible_ssh_private_key_file"], str(birth_key))
+        self.assertTrue(host_vars["jit_ca_manage_authorized_keys"])
+        self.assertEqual(host_vars["jit_ca_break_glass_pubkey"], escrowed_pub.read_text().strip())
+        self.assertIn("airlock-birth-key", host_vars["jit_ca_purge_birth_pubkey"])
+
+        # Verify allowlist updated in memory and on disk
+        self.assertTrue(self.approver.is_target_allowlisted("transcribe"))
+        self.assertIn("transcribe", allowlist_file.read_text().splitlines())
+        self.assertIn("ENROLL", Path(self.audit_file).read_text())
+
+    def test_jit08_enroll_fails_closed_if_playbook_fails(self):
+        """JIT-08b: If ansible-playbook fails during enrollment, target is NOT added to TARGET_ALLOWLIST."""
+        ca_pub = Path(self.tmpdir.name) / "user_ca.pub"
+        ca_pub.write_text(SAMPLE_PUBKEY + "\n")
+        birth_key = Path(self.tmpdir.name) / "birth_key"
+        birth_key.write_text("PRIVATE_BIRTH_KEY\n")
+        playbook = Path(self.tmpdir.name) / "onboard-target.yml"
+        playbook.write_text("---\n- hosts: jit_ca_targets\n")
+        escrow_dir = Path(self.tmpdir.name) / "escrow"
+
+        self.approver.USER_CA_PUBKEY_FILE = str(ca_pub)
+        self.approver.BIRTH_KEY_FILE = str(birth_key)
+        self.approver.ONBOARD_PLAYBOOK = str(playbook)
+        self.approver.BREAK_GLASS_ESCROW_DIR = str(escrow_dir)
+        self.approver.ALLOWLIST_FILE = ""
+
+        self.approver.handle_request(json.dumps({
+            "action": "enroll",
+            "req_id": SAMPLE_REQ_ID,
+            "target": "new-lxc",
+            "target_ip": "10.6.31.9",
+            "reason": "test failure",
+        }))
+        token = next(iter(self.approver._pending.keys()))
+        real_run = subprocess.run
+
+        def failing_playbook_run(cmd, *a, **kw):
+            if cmd[0] == "ssh-keygen":
+                return real_run(cmd, *a, **kw)
+            if cmd[0] == self.approver.ANSIBLE_PLAYBOOK_CMD:
+                raise subprocess.CalledProcessError(2, cmd, stderr="UNREACHABLE")
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        with mock.patch.object(self.approver.subprocess, "run", side_effect=failing_playbook_run):
+            code, _ = self._invoke_post("/approve", token)
+
+        self.assertEqual(code, 500)
+        self.assertFalse(self.approver.is_target_allowlisted("new-lxc"))
+        self.assertIn("ENROLL_FAIL", Path(self.audit_file).read_text())
+
+    def test_jit08_airlock_cli_and_symlinks(self):
+        """JIT-08c: jit-enroll and airlock-* symlinks exist and are executable."""
+        for script_name in ("jit-enroll", "airlock-enroll", "airlock-request", "airlock-approver.py"):
+            p = REPO_ROOT / "scripts" / script_name
+            self.assertTrue(p.exists(), f"Missing {p}")
+            self.assertTrue(os.access(p, os.X_OK), f"{p} is not executable")
+
+
 if __name__ == "__main__":
     unittest.main()

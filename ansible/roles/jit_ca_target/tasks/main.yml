@@ -122,3 +122,13 @@
         group: root
         mode: "0755"
   when: jit_ca_hypervisor_guard_enabled | bool
+
+- name: Scrub Day-0 birth public key from /root/.ssh/authorized_keys (when present)
+  ansible.builtin.lineinfile:
+    path: /root/.ssh/authorized_keys
+    line: "{{ jit_ca_purge_birth_pubkey | trim }}"
+    state: absent
+  when:
+    - jit_ca_purge_birth_pubkey is string
+    - jit_ca_purge_birth_pubkey | trim | length > 0
+  failed_when: false

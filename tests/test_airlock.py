@@ -1164,5 +1164,55 @@ class TestNewReviewFixes(unittest.TestCase):
         self.assertIn("--provisioner-password-file=/etc/airlock/secrets/provisioner_password", server_tasks)
 
 
+
+    def test_1password_escrow_helper_script(self):
+        """airlock-escrow-1password pipes JSON item payload to `op item create -` without leaking key in argv."""
+        script = REPO_ROOT / "scripts" / "airlock-escrow-1password"
+        mock_op = Path(self.tmpdir.name) / "mock-op"
+        captured_stdin = Path(self.tmpdir.name) / "op_stdin.json"
+        captured_args = Path(self.tmpdir.name) / "op_args.txt"
+        token_file = Path(self.tmpdir.name) / "op.token"
+        token_file.write_text("ops_dummy_service_account_token\n")
+
+        mock_op.write_text(
+            f"""#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+assert os.environ.get("OP_SERVICE_ACCOUNT_TOKEN") == "ops_dummy_service_account_token"
+Path({str(captured_args)!r}).write_text(" ".join(sys.argv[1:]))
+Path({str(captured_stdin)!r}).write_text(sys.stdin.read())
+print('{{"id": "op_item_12345"}}')
+"""
+        )
+        mock_op.chmod(0o755)
+
+        fake_priv = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA=\n-----END OPENSSH PRIVATE KEY-----\n"
+        env = os.environ.copy()
+        env["AIRLOCK_OP_BIN"] = str(mock_op)
+        env["AIRLOCK_OP_TOKEN_FILE"] = str(token_file)
+        env["AIRLOCK_OP_VAULT"] = "Homelab Break-Glass"
+
+        res = subprocess.run(
+            [str(script), "transcribe", "10.6.31.1"],
+            input=fake_priv,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(res.returncode, 0, msg=res.stderr)
+        self.assertIn("id=op_item_12345", res.stdout)
+
+        # Verify private key was NOT passed in CLI args, only via JSON stdin
+        args_str = captured_args.read_text()
+        self.assertNotIn("BEGIN OPENSSH PRIVATE KEY", args_str)
+        self.assertIn("item create --vault Homelab Break-Glass --format json -", args_str)
+
+        payload = json.loads(captured_stdin.read_text())
+        self.assertEqual(payload["title"], "Airlock Break-Glass — transcribe (10.6.31.1)")
+        fields = {f["id"]: f["value"] for f in payload["fields"]}
+        self.assertEqual(fields["ssh_private_key"], fake_priv)
+
+
 if __name__ == "__main__":
     unittest.main()

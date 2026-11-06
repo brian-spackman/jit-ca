@@ -35,7 +35,9 @@ airlock_initial_targets:
 
 # Day-0 Tap-to-Enroll settings on the Airlock server
 airlock_bootstrap_user: "root"
-airlock_break_glass_escrow_cmd: ""
+airlock_break_glass_escrow_cmd: "{{ '/usr/local/bin/airlock-escrow-1password' if (airlock_op_service_account_token | length > 0) else '' }}"
+airlock_op_service_account_token: ""
+airlock_op_vault: "Homelab Break-Glass"
 
 # Optional Proxmox hypervisor self-reference guard & auto-evacuation inside the Airlock VM
 airlock_hypervisor_guard_enabled: false

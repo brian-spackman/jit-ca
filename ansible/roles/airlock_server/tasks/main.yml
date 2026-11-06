@@ -161,6 +161,24 @@
     - { src: "{{ playbook_dir }}/roles", dest: "/etc/airlock/ansible/" }
     - { src: "{{ playbook_dir }}/../contrib/proxmox-hypervisor-guard", dest: "/etc/airlock/contrib/" }
 
+- name: Install /usr/local/bin/airlock-escrow-1password helper
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/airlock-escrow-1password"
+    dest: /usr/local/bin/airlock-escrow-1password
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Seed /etc/airlock/op-service-account.token when 1Password Service Account is configured
+  ansible.builtin.copy:
+    dest: /etc/airlock/op-service-account.token
+    content: "{{ (airlock_op_service_account_token | trim) ~ '\n' }}"
+    owner: step
+    group: step
+    mode: "0600"
+  no_log: true
+  when: airlock_op_service_account_token | length > 0
+
 - name: Seed /etc/airlock/target-allowlist.txt if not already present
   ansible.builtin.copy:
     dest: /etc/airlock/target-allowlist.txt

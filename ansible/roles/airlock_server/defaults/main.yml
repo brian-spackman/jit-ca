@@ -1,7 +1,7 @@
 ---
-# Default variables for airlock_server role (VM 1901 / 10.6.19.1)
+# Default variables for airlock_server role (VM 10001 / 10.6.10.1)
 
-airlock_host_ip: "{{ ansible_host | default('10.6.19.1') }}"
+airlock_host_ip: "{{ ansible_host | default('10.6.10.1') }}"
 airlock_webhook_port: 8081
 airlock_ntfy_port: 8080
 airlock_ntfy_base_url: "http://{{ airlock_host_ip }}:{{ airlock_ntfy_port }}"
@@ -41,7 +41,7 @@ airlock_op_vault: "Homelab Break-Glass"
 
 # Optional Proxmox hypervisor self-reference guard & auto-evacuation inside the Airlock VM
 airlock_hypervisor_guard_enabled: false
-airlock_pve_vmid: "1901"
+airlock_pve_vmid: "10001"
 airlock_pve_peer_map: "optimuxprime:metroplex,metroplex:optimuxprime"
 airlock_pve_api_urls: {}
 # e.g.:

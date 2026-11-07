@@ -1,9 +1,10 @@
 ---
-- name: Validate airlock_precheck_mode value
+- name: Validate airlock_precheck_mode and airlock_ca_backend values
   ansible.builtin.assert:
     that:
       - airlock_precheck_mode in ['boundary_only', 'silent_precheck']
-    fail_msg: "airlock_precheck_mode must be 'boundary_only' or 'silent_precheck'."
+      - airlock_ca_backend in ['openbao', 'step-ca']
+    fail_msg: "airlock_precheck_mode must be 'boundary_only'/'silent_precheck' and airlock_ca_backend must be 'openbao'/'step-ca'."
 
 - name: Install baseline packages for Airlock server
   ansible.builtin.apt:
@@ -18,6 +19,24 @@
       - qemu-guest-agent
     state: present
     update_cache: true
+
+- name: Ensure openbao system group exists (GID 10302)
+  ansible.builtin.group:
+    name: "{{ airlock_openbao_group }}"
+    gid: "{{ airlock_openbao_gid }}"
+    system: true
+    state: present
+
+- name: Ensure openbao system user exists (UID 10302)
+  ansible.builtin.user:
+    name: "{{ airlock_openbao_user }}"
+    uid: "{{ airlock_openbao_uid }}"
+    group: "{{ airlock_openbao_group }}"
+    system: true
+    home: /var/lib/openbao
+    create_home: false
+    shell: /usr/sbin/nologin
+    state: present
 
 - name: Ensure step system group exists
   ansible.builtin.group:
@@ -35,6 +54,18 @@
     shell: /usr/sbin/nologin
     state: present
 
+- name: Create /etc/openbao and /var/lib/openbao directory hierarchy
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ airlock_openbao_user }}"
+    group: "{{ airlock_openbao_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ airlock_openbao_config_dir }}", mode: "0750" }
+    - { path: "/var/lib/openbao", mode: "0750" }
+    - { path: "{{ airlock_openbao_storage_dir }}", mode: "0700" }
+
 - name: Create /etc/airlock and /var/log/airlock directory hierarchy
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -51,17 +82,6 @@
     - { path: "/etc/airlock/ansible", mode: "0755" }
     - { path: "/etc/airlock/contrib", mode: "0755" }
     - { path: "/var/log/airlock", mode: "0750" }
-
-- name: Generate provisioner password if not already present
-  ansible.builtin.shell: |
-    set -euo pipefail
-    umask 0077
-    head -c 32 /dev/urandom | base64 > /etc/airlock/secrets/provisioner_password
-    chown step:step /etc/airlock/secrets/provisioner_password
-    chmod 0600 /etc/airlock/secrets/provisioner_password
-  args:
-    executable: /bin/bash
-    creates: /etc/airlock/secrets/provisioner_password
 
 - name: Seed /etc/airlock/secrets/ntfy-approver-token if not already present
   ansible.builtin.copy:
@@ -94,60 +114,145 @@
     - { path: "/etc/airlock/secrets/birth_key.pub", mode: "0644" }
   when: not ansible_check_mode
 
-- name: Initialize step-ca with SSH certificate support if not already initialized
-  ansible.builtin.command:
-    cmd: >
-      step ca init
-      --ssh
-      --name="{{ airlock_ca_name }}"
-      --dns="{{ airlock_ca_dns }}"
-      --address="{{ airlock_ca_address }}"
-      --provisioner="{{ airlock_provisioner_name }}"
-      --password-file=/etc/airlock/secrets/provisioner_password
-      --provisioner-password-file=/etc/airlock/secrets/provisioner_password
-    creates: /etc/airlock/config/ca.json
-  environment:
-    STEPPATH: /etc/airlock
-  become: true
-  become_user: step
-  notify: Restart step-ca
+- name: Configure OpenBao Server (UID 10302) as Core Vault & SSH CA Engine
+  block:
+    - name: Render /etc/openbao/openbao.hcl
+      ansible.builtin.copy:
+        dest: "{{ airlock_openbao_config_dir }}/openbao.hcl"
+        content: |
+          ui = false
+          disable_mlock = true
+          api_addr = "{{ airlock_openbao_addr }}"
+          cluster_addr = "http://127.0.0.1:8201"
 
-- name: Install step-ca systemd unit
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/step-ca.service
-    content: |
-      [Unit]
-      Description=step-ca (Airlock SSH CA)
-      After=network-online.target
-      Wants=network-online.target
+          storage "raft" {
+            path    = "{{ airlock_openbao_storage_dir }}"
+            node_id = "airlock-10002"
+          }
 
-      [Service]
-      Type=simple
-      User=step
-      Group=step
-      Environment=STEPPATH=/etc/airlock
-      WorkingDirectory=/etc/airlock
-      ExecStart=/usr/bin/step-ca /etc/airlock/config/ca.json --password-file=/etc/airlock/secrets/provisioner_password
-      Restart=on-failure
-      RestartSec=5
-      NoNewPrivileges=true
-      ProtectSystem=strict
-      ProtectHome=true
-      PrivateTmp=true
-      ReadOnlyPaths=/etc/airlock
-      ReadWritePaths=/etc/airlock/db
-      ProtectKernelTunables=true
-      ProtectControlGroups=true
-      RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+          listener "tcp" {
+            address     = "{{ airlock_openbao_listen_address }}"
+            tls_disable = 1
+          }
+        owner: "{{ airlock_openbao_user }}"
+        group: "{{ airlock_openbao_group }}"
+        mode: "0640"
+      notify: Restart openbao
 
-      [Install]
-      WantedBy=multi-user.target
-    owner: root
-    group: root
-    mode: "0644"
-  notify:
-    - Reload systemd daemon
-    - Restart step-ca
+    - name: Install openbao systemd unit (UID 10302)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/openbao.service
+        content: |
+          [Unit]
+          Description=OpenBao KeyVault & SSH CA Engine (Airlock VM 10002 / UID 10302)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ airlock_openbao_user }}
+          Group={{ airlock_openbao_group }}
+          WorkingDirectory=/var/lib/openbao
+          ExecStart=/usr/bin/bao server -config={{ airlock_openbao_config_dir }}/openbao.hcl
+          ExecReload=/bin/kill -HUP $MAINPID
+          Restart=on-failure
+          RestartSec=5
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          PrivateTmp=true
+          ReadOnlyPaths={{ airlock_openbao_config_dir }}
+          ReadWritePaths=/var/lib/openbao
+          ProtectKernelTunables=true
+          ProtectControlGroups=true
+          RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd daemon
+        - Restart openbao
+
+    - name: Install /usr/local/libexec/airlock-openbao-bootstrap helper
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/airlock-openbao-bootstrap"
+        dest: /usr/local/libexec/airlock-openbao-bootstrap
+        owner: root
+        group: root
+        mode: "0755"
+  when: airlock_ca_backend == 'openbao'
+
+- name: Configure Legacy step-ca Engine (when airlock_ca_backend == 'step-ca')
+  block:
+    - name: Generate provisioner password if not already present
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 0077
+        head -c 32 /dev/urandom | base64 > /etc/airlock/secrets/provisioner_password
+        chown step:step /etc/airlock/secrets/provisioner_password
+        chmod 0600 /etc/airlock/secrets/provisioner_password
+      args:
+        executable: /bin/bash
+        creates: /etc/airlock/secrets/provisioner_password
+
+    - name: Initialize step-ca with SSH certificate support if not already initialized
+      ansible.builtin.command:
+        cmd: >
+          step ca init
+          --ssh
+          --name="{{ airlock_ca_name }}"
+          --dns="{{ airlock_ca_dns }}"
+          --address="{{ airlock_ca_address }}"
+          --provisioner="{{ airlock_provisioner_name }}"
+          --password-file=/etc/airlock/secrets/provisioner_password
+          --provisioner-password-file=/etc/airlock/secrets/provisioner_password
+        creates: /etc/airlock/config/ca.json
+      environment:
+        STEPPATH: /etc/airlock
+      become: true
+      become_user: step
+      notify: Restart step-ca
+
+    - name: Install step-ca systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/step-ca.service
+        content: |
+          [Unit]
+          Description=step-ca (Airlock SSH CA)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=step
+          Group=step
+          Environment=STEPPATH=/etc/airlock
+          WorkingDirectory=/etc/airlock
+          ExecStart=/usr/bin/step-ca /etc/airlock/config/ca.json --password-file=/etc/airlock/secrets/provisioner_password
+          Restart=on-failure
+          RestartSec=5
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          PrivateTmp=true
+          ReadOnlyPaths=/etc/airlock
+          ReadWritePaths=/etc/airlock/db
+          ProtectKernelTunables=true
+          ProtectControlGroups=true
+          RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd daemon
+        - Restart step-ca
+  when: airlock_ca_backend == 'step-ca'
 
 - name: Sync onboard-target.yml, airlock_target role, and contrib helpers to /etc/airlock
   ansible.builtin.copy:
@@ -208,9 +313,19 @@
         | regex_replace('(?m)^STAMP_APPROVER_PRINCIPAL = .*$', 'STAMP_APPROVER_PRINCIPAL = ' ~ ('True' if (airlock_stamp_approver_principal | bool) else 'False'))
         | regex_replace('(?m)^PRECHECK_MODE = .*$', 'PRECHECK_MODE = "' ~ airlock_precheck_mode ~ '"')
         | regex_replace('(?m)^OPA_PRECHECK_URL = .*$', 'OPA_PRECHECK_URL = "' ~ airlock_opa_precheck_url ~ '"')
+        | regex_replace('(?m)^CA_BACKEND = .*$', 'CA_BACKEND = "' ~ airlock_ca_backend ~ '"')
+        | regex_replace('(?m)^OPENBAO_ADDR = .*$', 'OPENBAO_ADDR = "' ~ airlock_openbao_addr ~ '"')
+        | regex_replace('(?m)^OPENBAO_SSH_MOUNT = .*$', 'OPENBAO_SSH_MOUNT = "' ~ airlock_openbao_ssh_mount ~ '"')
+        | regex_replace('(?m)^OPENBAO_SSH_ROLE = .*$', 'OPENBAO_SSH_ROLE = "' ~ airlock_openbao_ssh_role ~ '"')
+        | regex_replace('(?m)^OPENBAO_KV_MOUNT = .*$', 'OPENBAO_KV_MOUNT = "' ~ airlock_openbao_kv_mount ~ '"')
+        | regex_replace('(?m)^OPENBAO_TRANSIT_MOUNT = .*$', 'OPENBAO_TRANSIT_MOUNT = "' ~ airlock_openbao_transit_mount ~ '"')
+        | regex_replace('(?m)^OPENBAO_ESCROW_ENABLED = .*$', 'OPENBAO_ESCROW_ENABLED = ' ~ ('True' if (airlock_openbao_escrow_enabled | bool) else 'False'))
+        | regex_replace('(?m)^OPENBAO_WRAP_TTL = .*$', 'OPENBAO_WRAP_TTL = "' ~ airlock_openbao_wrap_ttl ~ '"')
         | regex_replace('(?m)^PROVISIONER = .*$', 'PROVISIONER = "' ~ airlock_provisioner_name ~ '"')
         | regex_replace('(?m)^PRINCIPAL = .*$', 'PRINCIPAL = "' ~ airlock_principal_user ~ '"')
         | regex_replace('(?m)^TARGET_ALLOWLIST = .*$', 'TARGET_ALLOWLIST = set(' ~ (airlock_initial_targets | to_json) ~ ')')
+        | regex_replace('(?m)^S0_PROTECTED_TARGETS = .*$', 'S0_PROTECTED_TARGETS = set(' ~ (airlock_s0_protected_targets | to_json) ~ ')')
+        | regex_replace('(?m)^S0_APPROVERS = .*$', 'S0_APPROVERS = set(' ~ (airlock_s0_approvers | to_json) ~ ')')
         | regex_replace('(?m)^BOOTSTRAP_USER = .*$', 'BOOTSTRAP_USER = "' ~ airlock_bootstrap_user ~ '"')
         | regex_replace('(?m)^BREAK_GLASS_ESCROW_CMD = .*$', 'BREAK_GLASS_ESCROW_CMD = "' ~ airlock_break_glass_escrow_cmd ~ '"')
       }}

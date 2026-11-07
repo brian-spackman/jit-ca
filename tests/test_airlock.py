@@ -327,6 +327,7 @@ class TestBaselineApproverClaims(unittest.TestCase):
         self.assertEqual(sorted(codes), [200, 410])
 
     def test_sign_cert_cleans_up_tempdir_on_success_and_failure(self):
+        self.approver.CA_BACKEND = "step-ca"
         created_dirs = []
 
         def fake_ok_run(cmd, *args, **kwargs):
@@ -482,6 +483,7 @@ class TestNewReviewFixes(unittest.TestCase):
 
     def test_airlock01_sign_cert_scopes_principal_per_target(self):
         """AIRLOCK-01: Each target gets a distinct '<PRINCIPAL>@<target>' in --principal, positional key ID, and audit log."""
+        self.approver.CA_BACKEND = "step-ca"
         self.approver.TARGET_ALLOWLIST = {"target-host-1", "target-host-2"}
         captured_step_cmds = []
 
@@ -746,6 +748,7 @@ class TestNewReviewFixes(unittest.TestCase):
         evac_script.write_text("#!/bin/sh\nexit 0\n")
         evac_script.chmod(0o755)
 
+        self.approver.CA_BACKEND = "step-ca"
         self.approver.CURRENT_HOST_FILE = str(host_file)
         self.approver.EVACUATE_CMD = str(evac_script)
 
@@ -952,6 +955,7 @@ class TestNewReviewFixes(unittest.TestCase):
 
     def test_airlock09_multi_approver_routing_principal_stamping_and_opa_silent_precheck(self):
         """AIRLOCK-09: Supports per-approver ntfy topics, approved-by-<approver>@<target> principal stamping, and silent_precheck OPA mode (zero permission oracle)."""
+        self.approver.CA_BACKEND = "step-ca"
         self.approver.PER_APPROVER_TOPICS = True
         self.approver.STAMP_APPROVER_PRINCIPAL = True
 
@@ -1212,6 +1216,317 @@ print('{{"id": "op_item_12345"}}')
         self.assertEqual(payload["title"], "Airlock Break-Glass — transcribe (10.6.31.1)")
         fields = {f["id"]: f["value"] for f in payload["fields"]}
         self.assertEqual(fields["ssh_private_key"], fake_priv)
+
+
+
+class TestOpenBaoEngineAndS0Guard(unittest.TestCase):
+    """Tests for OpenBao (UID 10302 / VM 10002) core engine, Cubbyhole response wrapping, kv-v2 escrow, and Proxmox S0 taint guard."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.token_file = os.path.join(self.tmpdir.name, "ntfy_token")
+        self.bao_token_file = os.path.join(self.tmpdir.name, "openbao_token")
+        self.audit_file = os.path.join(self.tmpdir.name, "audit.log")
+        Path(self.token_file).write_text("test-secret-token\n")
+        Path(self.bao_token_file).write_text("hvs.openbao-approver-token-10302\n")
+        self.approver = load_approver_module(self.token_file, self.audit_file)
+        self.approver.OPENBAO_TOKEN_FILE = self.bao_token_file
+        self.published = []
+
+        def fake_publish(topic, message, title=None, actions=None, tags=None, priority=None):
+            self.published.append({
+                "topic": topic,
+                "message": message,
+                "title": title,
+                "actions": actions,
+                "tags": tags,
+                "priority": priority,
+            })
+
+        self.approver.ntfy_publish = fake_publish
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _invoke_post(self, path: str, body: str):
+        req = FakeWebhookRequest(self.approver.Handler, path, body)
+        return req.run()
+
+    def test_openbao_default_backend_and_ssh_cert_signing(self):
+        """AIRLOCK-11a: OpenBao is the default CA_BACKEND and signs SSH certs via POST /v1/ssh-client-signer/sign/airlock-signer."""
+        self.assertEqual(self.approver.CA_BACKEND, "openbao")
+        self.approver.STAMP_APPROVER_PRINCIPAL = True
+
+        req_payload = json.dumps({
+            "req_id": SAMPLE_REQ_ID,
+            "target": "target-host-1",
+            "duration": "1h",
+            "reason": "deploy container via openbao ca",
+            "pubkey": SAMPLE_PUBKEY,
+            "approver": "teletraan",
+        })
+        self.approver.handle_request(req_payload)
+        token = next(iter(self.approver._pending.keys()))
+
+        captured_http = {}
+
+        class FakeBaoResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+            def read(self):
+                return json.dumps({
+                    "data": {
+                        "signed_key": "ssh-ed25519-cert-v01@openssh.com AAAA_OPENBAO_SIGNED_CERT",
+                        "serial_number": "c0ffee1234",
+                    }
+                }).encode()
+
+        def fake_urlopen(req_obj, timeout=15):
+            captured_http["url"] = req_obj.full_url
+            captured_http["method"] = req_obj.get_method()
+            captured_http["headers"] = dict(req_obj.header_items())
+            captured_http["body"] = json.loads(req_obj.data.decode())
+            return FakeBaoResp()
+
+        def fake_keygen(cmd, *a, **kw):
+            self.assertEqual(cmd[0], "ssh-keygen")
+            return subprocess.CompletedProcess(cmd, 0, stdout="        Valid: from 2026-11-07T10:00:00 to 2026-11-07T11:00:00\n", stderr="")
+
+        with mock.patch.object(self.approver.urlrequest, "urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(self.approver.subprocess, "run", side_effect=fake_keygen):
+            code, body = self._invoke_post("/approve", token)
+
+        self.assertEqual(code, 200)
+        self.assertEqual(body, "approved")
+        self.assertEqual(captured_http["url"], "http://127.0.0.1:8200/v1/ssh-client-signer/sign/airlock-signer")
+        self.assertEqual(captured_http["headers"].get("X-vault-token"), "hvs.openbao-approver-token-10302")
+        self.assertEqual(
+            captured_http["body"]["valid_principals"],
+            "airlock-admin@target-host-1,approved-by-teletraan@target-host-1",
+        )
+        self.assertEqual(captured_http["body"]["ttl"], "1h")
+        self.assertEqual(captured_http["body"]["key_id"], "airlock-admin@target-host-1")
+
+        cert_msgs = [m for m in self.published if m["topic"] == self.approver.TOPIC_CERT]
+        self.assertEqual(len(cert_msgs), 1)
+        cert_payload = json.loads(cert_msgs[0]["message"])
+        self.assertEqual(cert_payload["cert"], "ssh-ed25519-cert-v01@openssh.com AAAA_OPENBAO_SIGNED_CERT")
+
+    def test_openbao_cubbyhole_wrapped_secret_release_and_break_glass_denial(self):
+        """AIRLOCK-11b: action=='secret' releases a single-use X-Vault-Wrap-TTL token on TOPIC_CERT and blocks break-glass/* paths."""
+        # 1. Attempting to request break-glass keys or path traversal via action=='secret' must be rejected
+        for forbidden_path in ("break-glass/target-host-1", "break_glass/foo", "../secret/root", "/leading/slash"):
+            self.approver.handle_request(json.dumps({
+                "action": "secret",
+                "req_id": SAMPLE_REQ_ID,
+                "target": "target-host-1",
+                "secret_path": forbidden_path,
+                "reason": "attempt break-glass exfil",
+            }))
+            self.assertEqual(len(self.approver._pending), 0, f"Forbidden secret_path {forbidden_path!r} must be rejected")
+
+        # 2. Valid gated secret request (e.g. 'zfs/metroplex') queues approval and wraps with X-Vault-Wrap-TTL: 60s
+        self.approver.handle_request(json.dumps({
+            "action": "secret",
+            "req_id": SAMPLE_REQ_ID,
+            "target": "target-host-1",
+            "secret_path": "zfs/metroplex",
+            "reason": "unlock encrypted ZFS pool on boot",
+        }))
+        self.assertEqual(len(self.approver._pending), 1)
+        self.assertEqual(self.published[-1]["actions"][0]["label"], "Approve: Wrap Secret")
+        token = next(iter(self.approver._pending.keys()))
+
+        captured_wrap_req = {}
+
+        class FakeWrapResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+            def read(self):
+                return json.dumps({
+                    "wrap_info": {
+                        "token": "hvs.CAES_SINGLE_USE_WRAP_TOKEN_999",
+                        "ttl": 60,
+                        "creation_time": "2026-11-07T10:30:00Z",
+                    }
+                }).encode()
+
+        def fake_wrap_urlopen(req_obj, timeout=15):
+            captured_wrap_req["url"] = req_obj.full_url
+            captured_wrap_req["headers"] = dict(req_obj.header_items())
+            return FakeWrapResp()
+
+        with mock.patch.object(self.approver.urlrequest, "urlopen", side_effect=fake_wrap_urlopen):
+            code, body = self._invoke_post("/approve", token)
+
+        self.assertEqual(code, 200)
+        self.assertEqual(body, "wrapped")
+        self.assertEqual(captured_wrap_req["url"], "http://127.0.0.1:8200/v1/secret/data/zfs/metroplex")
+        self.assertEqual(captured_wrap_req["headers"].get("X-vault-wrap-ttl"), "60s")
+
+        cert_msgs = [m for m in self.published if m["topic"] == self.approver.TOPIC_CERT]
+        self.assertEqual(len(cert_msgs), 1)
+        msg_body = json.loads(cert_msgs[0]["message"])
+        self.assertEqual(msg_body["wrap_token"], "hvs.CAES_SINGLE_USE_WRAP_TOKEN_999")
+        self.assertEqual(msg_body["secret_path"], "zfs/metroplex")
+        self.assertIn("SECRET_WRAP", Path(self.audit_file).read_text())
+
+        # 3. Verify airlock-request --secret CLI unwraps or prints wrap_token
+        req_mod = load_request_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            req_mod.TOKEN_FILE = tmp_path / "token"
+            req_mod.TOKEN_FILE.write_text("agent-token\n")
+            fixed_req_id = "feedface12345678"
+
+            def fake_cli_urlopen(request_obj, timeout=15):
+                url = request_obj.full_url
+                if url.endswith("/"):
+                    return io.BytesIO(b'{"id":"msg1"}')
+                if "/v1/sys/wrapping/unwrap" in url:
+                    return io.BytesIO(json.dumps({"data": {"data": {"passphrase": "zfs-secret-key"}}}).encode())
+                line = json.dumps({
+                    "event": "message",
+                    "message": json.dumps({
+                        "req_id": fixed_req_id,
+                        "wrap_token": "hvs.CAES_SINGLE_USE_WRAP_TOKEN_999",
+                    }),
+                })
+                return io.BytesIO((line + "\n").encode())
+
+            out_buf = io.StringIO()
+            with mock.patch.object(req_mod.secrets, "token_hex", return_value=fixed_req_id), \
+                 mock.patch.object(req_mod.urlrequest, "urlopen", side_effect=fake_cli_urlopen), \
+                 mock.patch.dict(os.environ, {"AIRLOCK_UNWRAP_ADDR": "http://10.6.10.2:8200"}), \
+                 mock.patch.object(sys, "argv", ["airlock-request", "--secret", "target-host-1", "zfs/metroplex", "boot unlock"]), \
+                 mock.patch("sys.stdout", out_buf):
+                req_mod.main()
+
+            self.assertEqual(json.loads(out_buf.getvalue().strip()), {"passphrase": "zfs-secret-key"})
+
+    def test_openbao_kv_v2_break_glass_escrow_and_rollback_on_enroll_failure(self):
+        """AIRLOCK-11c: enroll_target escrows break-glass key to OpenBao kv-v2 and rolls back on playbook failure."""
+        birth_key = Path(self.tmpdir.name) / "birth_key"
+        birth_key.write_text("PRIVATE_BIRTH_KEY\n")
+        playbook = Path(self.tmpdir.name) / "onboard-target.yml"
+        playbook.write_text("---\n- hosts: airlock_targets\n")
+        escrow_dir = Path(self.tmpdir.name) / "escrow"
+
+        # Leave USER_CA_PUBKEY_FILE nonexistent so enroll_target fetches it from OpenBao GET /v1/ssh-client-signer/config/ca
+        self.approver.USER_CA_PUBKEY_FILE = os.path.join(self.tmpdir.name, "nonexistent_ca.pub")
+        self.approver.BIRTH_KEY_FILE = str(birth_key)
+        self.approver.ONBOARD_PLAYBOOK = str(playbook)
+        self.approver.BREAK_GLASS_ESCROW_DIR = str(escrow_dir)
+        self.approver.ALLOWLIST_FILE = ""
+
+        bao_calls = []
+
+        class FakeBaoApiResp:
+            def __init__(self, payload):
+                self._payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+            def read(self):
+                return json.dumps(self._payload).encode()
+
+        def fake_bao_urlopen(req_obj, timeout=15):
+            method = req_obj.get_method()
+            url = req_obj.full_url
+            body = json.loads(req_obj.data.decode()) if req_obj.data else None
+            bao_calls.append((method, url, body))
+            if method == "GET" and url.endswith("/v1/ssh-client-signer/config/ca"):
+                return FakeBaoApiResp({"data": {"public_key": SAMPLE_PUBKEY}})
+            return FakeBaoApiResp({"data": {"version": 1}})
+
+        real_run = subprocess.run
+
+        def fail_playbook(cmd, *a, **kw):
+            if cmd[0] == "ssh-keygen":
+                return real_run(cmd, *a, **kw)
+            if cmd[0] == self.approver.ANSIBLE_PLAYBOOK_CMD:
+                raise subprocess.CalledProcessError(2, cmd, stderr="UNREACHABLE")
+            raise AssertionError(f"Unexpected cmd: {cmd}")
+
+        with mock.patch.object(self.approver.urlrequest, "urlopen", side_effect=fake_bao_urlopen), \
+             mock.patch.object(self.approver.subprocess, "run", side_effect=fail_playbook):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.approver.enroll_target({"target": "bao-box", "target_ip": "10.6.31.20"})
+
+        methods_urls = [(m, u) for m, u, _ in bao_calls]
+        self.assertIn(("GET", "http://127.0.0.1:8200/v1/ssh-client-signer/config/ca"), methods_urls)
+        self.assertIn(("POST", "http://127.0.0.1:8200/v1/secret/data/break-glass/bao-box"), methods_urls)
+        self.assertIn(("DELETE", "http://127.0.0.1:8200/v1/secret/metadata/break-glass/bao-box"), methods_urls)
+
+    def test_s0_protected_hypervisor_taint_guard_and_set_host_helper(self):
+        """AIRLOCK-11d: Proxmox S0-protected hypervisors reject non-S0 agent approvers and allow human S0 stewards (brian / brian-adm)."""
+        s0_file = Path(self.tmpdir.name) / "s0-protected-hosts"
+        s0_file.write_text("optimuxprime\n")
+        self.approver.S0_PROTECTED_HOSTS_FILE = str(s0_file)
+        self.approver.TARGET_ALLOWLIST = {"optimuxprime", "metroplex"}
+        self.approver.S0_APPROVERS = {"brian", "brian-adm"}
+
+        # 1. Agent approver ('teletraan') requesting SSH cert on S0-protected 'optimuxprime' is rejected at intake
+        self.approver.handle_request(json.dumps({
+            "req_id": SAMPLE_REQ_ID,
+            "target": "optimuxprime",
+            "duration": "30m",
+            "reason": "automated hypervisor change",
+            "pubkey": SAMPLE_PUBKEY,
+            "approver": "teletraan",
+        }))
+        self.assertEqual(len(self.approver._pending), 0)
+        self.assertIn("REJECT_S0_PROTECTED", Path(self.audit_file).read_text())
+
+        # 2. If 'metroplex' was NOT S0-tainted when requested by 'teletraan', but migrated an S0 guest onto itself before /approve:
+        self.approver.handle_request(json.dumps({
+            "req_id": "b1b2c3d4e5f60718",
+            "target": "metroplex",
+            "duration": "30m",
+            "reason": "hypervisor change",
+            "pubkey": SAMPLE_PUBKEY,
+            "approver": "teletraan",
+        }))
+        self.assertEqual(len(self.approver._pending), 1)
+        tok_metroplex = next(iter(self.approver._pending.keys()))
+
+        # Now metroplex becomes S0-tainted before /approve is tapped:
+        s0_file.write_text("optimuxprime\nmetroplex\n")
+        code, body = self._invoke_post("/approve", tok_metroplex)
+        self.assertEqual(code, 403)
+        self.assertIn("SIGN_BLOCKED_S0_PROTECTED", Path(self.audit_file).read_text())
+
+        # 3. Human S0 steward ('brian-adm', UID 10001) IS permitted to request and approve on S0-protected 'optimuxprime'
+        self.approver.handle_request(json.dumps({
+            "req_id": "c1b2c3d4e5f60719",
+            "target": "optimuxprime",
+            "duration": "30m",
+            "reason": "human steward S0 maintenance",
+            "pubkey": SAMPLE_PUBKEY,
+            "approver": "brian-adm",
+        }))
+        self.assertEqual(len(self.approver._pending), 1)
+
+    def test_openbao_ansible_role_and_uid_10302_invariants(self):
+        """AIRLOCK-11e: Ansible airlock_server role and bootstrap helper enforce VM 10002 (10.6.10.2) and OpenBao UID/GID 10302."""
+        defaults_txt = (REPO_ROOT / "ansible" / "roles" / "airlock_server" / "defaults" / "main.yml").read_text()
+        tasks_txt = (REPO_ROOT / "ansible" / "roles" / "airlock_server" / "tasks" / "main.yml").read_text()
+        bootstrap_script = REPO_ROOT / "scripts" / "airlock-openbao-bootstrap"
+
+        self.assertIn("10.6.10.2", defaults_txt)
+        self.assertIn('airlock_ca_backend: "openbao"', defaults_txt)
+        self.assertIn("airlock_openbao_uid: 10302", defaults_txt)
+        self.assertIn("airlock_openbao_gid: 10302", defaults_txt)
+        self.assertIn('airlock_pve_vmid: "10002"', defaults_txt)
+        self.assertIn("openbao.hcl", tasks_txt)
+        self.assertIn("openbao.service", tasks_txt)
+        self.assertTrue(bootstrap_script.is_file())
+        self.assertTrue(os.access(bootstrap_script, os.X_OK))
 
 
 if __name__ == "__main__":

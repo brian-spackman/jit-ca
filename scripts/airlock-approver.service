@@ -1,8 +1,8 @@
 [Unit]
-Description=airlock-approver — out-of-band tap-to-sign approval & attestation daemon
-After=network-online.target ntfy.service step-ca.service
-Wants=network-online.target
-Requires=ntfy.service step-ca.service
+Description=airlock-approver — out-of-band tap-to-sign approval, attestation & OpenBao gatekeeper
+After=network-online.target ntfy.service openbao.service
+Wants=network-online.target openbao.service
+Requires=ntfy.service
 
 [Service]
 Type=simple

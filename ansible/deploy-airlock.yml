@@ -1,5 +1,5 @@
 ---
-- name: Provision Airlock Server (step-ca + ntfy + airlock-approver + Day-0 enrollment engine)
+- name: Provision Airlock Server (VM 10002 — OpenBao KeyVault & SSH CA UID 10302 + ntfy + airlock-approver)
   hosts: airlock_servers
   become: true
   roles:

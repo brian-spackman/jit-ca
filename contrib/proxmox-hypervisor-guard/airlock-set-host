@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Installed at /usr/local/libexec/airlock-set-host inside the Airlock VM (0755, root:root).
-# Invoked by Proxmox qemu-guest-agent hookscript on boot and post-migration.
+# Invoked by Proxmox qemu-guest-agent hookscript on boot, post-migration, and S0 audit.
+#
+# Usage:
+#   airlock-set-host <hypervisor-hostname> [--s0-hosts <host1,host2,...>]
 set -euo pipefail
 
 RAW_HOST="${1:-}"
 HOST_NODE="${RAW_HOST,,}"
 if [[ -z "$HOST_NODE" || ! "$HOST_NODE" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then
-    echo "Usage: airlock-set-host <hypervisor-hostname>" >&2
+    echo "Usage: airlock-set-host <hypervisor-hostname> [--s0-hosts <host1,host2,...>]" >&2
     exit 1
 fi
 
@@ -15,3 +18,19 @@ TMP_FILE="$(mktemp /run/airlock/current-hypervisor.XXXXXX)"
 printf '%s\n' "$HOST_NODE" > "$TMP_FILE"
 chmod 0444 "$TMP_FILE"
 mv -f "$TMP_FILE" /run/airlock/current-hypervisor
+
+if [[ "${2:-}" == "--s0-hosts" ]]; then
+    RAW_S0="${3:-}"
+    TMP_S0="$(mktemp /run/airlock/s0-protected-hosts.XXXXXX)"
+    : > "$TMP_S0"
+    IFS=',' read -ra S0_ARR <<< "${RAW_S0,,}"
+    for h in "${S0_ARR[@]}"; do
+        h="${h//[[:space:]]/}"
+        [[ -z "$h" ]] && continue
+        if [[ "$h" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then
+            printf '%s\n' "$h" >> "$TMP_S0"
+        fi
+    done
+    chmod 0444 "$TMP_S0"
+    mv -f "$TMP_S0" /run/airlock/s0-protected-hosts
+fi

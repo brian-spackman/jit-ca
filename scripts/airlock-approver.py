@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""airlock-approver — out-of-band tap-to-sign approval & attestation daemon for Airlock.
+"""airlock-approver — out-of-band tap-to-sign approval, attestation & OpenBao gatekeeper.
 
-Runs on the Airlock host as the `step` user. Two jobs in one process:
+Two threads + an HTTP server in a single process:
+  1. Subscribes to the local ntfy `airlock-requests` topic (agent-published).
+  2. For each valid request, checks target allowlist, Proxmox S0-tag hypervisor
+     taint guard, and optional OPA precheck (`PRECHECK_MODE`), stores a single-use
+     random approval token (`TOKEN_TTL` seconds), and sends an actionable push
+     notification to `airlock-approvals` (or `airlock-approvals-<approver>`)
+     with Approve / Deny buttons.
+  3. Listens on WEBHOOK_HOST:WEBHOOK_PORT for the button callback from the
+     approver's phone, verifies & consumes the token:
+     - `action == "sign"`: mints a short-lived SSH user certificate via OpenBao's
+       `ssh-client-signer` engine (or legacy `step-ca`), stamping both the
+       target principal (`airlock-admin@<target>`) and optional approver
+       identity (`approved-by-<approver>@<target>`), and publishes the signed
+       cert back over `airlock-certs`.
+     - `action == "secret"`: requests a gated secret from OpenBao `kv-v2` with
+       `X-Vault-Wrap-TTL: 60s` and publishes ONLY the single-use Cubbyhole
+       response-wrapping token (`wrap_token`) to `airlock-certs` so the raw
+       secret never crosses `ntfy`.
+     - `action == "enroll"`: generates a per-target break-glass Ed25519 keypair,
+       escrows it fail-closed (OpenBao `kv-v2` + 1Password + local `0600`),
+       executes `onboard-target.yml` over the Day-0 birth key, and atomically
+       locks the target to Airlock CA + break-glass only.
 
-  1. Subscribe to the ntfy `airlock-requests` topic. For each agent request
-     (target, duration, reason, pubkey, optional approver) mint a single-use,
-     short-lived challenge token, stash the *full* request under it server-side,
-     and publish an actionable `airlock-approvals` (or per-approver
-     `airlock-approvals-<approver>`) notification carrying Approve / Deny
-     http-action buttons.
-
-  2. Serve a tiny LAN webhook (/approve, /deny). When the designated approver
-     (human or agent steward) approves, the webhook validates the token
-     (single-use, unexpired), signs the request bound to that token with step-ca
-     (stamping both the target principal and the approver identity), and
-     publishes the signed cert back over the `airlock-certs` topic.
-
-See REPLICATION-GUIDE.md (Section 5) and AIRLOCK-SPEC.md for design rationale.
+See REPLICATION-GUIDE.md and AIRLOCK-SPEC.md for design rationale.
 """
 
 from collections import deque
@@ -37,11 +45,11 @@ from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
 # ---- config -----------------------------------------------------------------
-# PLACEHOLDER: set to the LAN IP of your Airlock box (CA_HOST in the guide).
+# PLACEHOLDER: set to the LAN IP of your Airlock box (VM 10002 / 10.6.10.2).
 # NTFY_LOCAL and WEBHOOK_HOST both need this same IP — ntfy and the webhook
 # are co-located on the Airlock box and the approver reaches the webhook over LAN.
-NTFY_LOCAL = "http://10.0.0.10:8080"       # ntfy binds the LAN IP, not loopback
-WEBHOOK_HOST = "10.0.0.10"                  # same as CA_HOST; approver POSTs here
+NTFY_LOCAL = "http://10.6.10.2:8080"        # ntfy binds the LAN IP, not loopback
+WEBHOOK_HOST = "10.6.10.2"                  # same as Airlock VM IP; approver POSTs here
 WEBHOOK_PORT = 8081
 WEBHOOK_URL = f"http://{WEBHOOK_HOST}:{WEBHOOK_PORT}"  # derived — do not edit separately
 
@@ -56,13 +64,25 @@ STAMP_APPROVER_PRINCIPAL = False            # when True, always stamps approved-
 PRECHECK_MODE = "boundary_only"             # "boundary_only" | "silent_precheck"
 OPA_PRECHECK_URL = ""                       # e.g. "http://127.0.0.1:8181/v1/data/airlock/allow"
 
+# Core CA & KeyVault Engine configuration ("openbao" default on UID 10302, or "step-ca" legacy):
+CA_BACKEND = "openbao"                      # "openbao" | "step-ca"
+OPENBAO_ADDR = "http://127.0.0.1:8200"
+OPENBAO_TOKEN_FILE = "/etc/airlock/secrets/openbao-approver-token"
+OPENBAO_SSH_MOUNT = "ssh-client-signer"
+OPENBAO_SSH_ROLE = "airlock-signer"
+OPENBAO_KV_MOUNT = "secret"
+OPENBAO_TRANSIT_MOUNT = "transit"
+OPENBAO_ESCROW_ENABLED = True
+OPENBAO_WRAP_TTL = "60s"
+
+# Legacy step-ca settings (used when CA_BACKEND == "step-ca"):
 TOKEN_FILE = "/etc/airlock/secrets/ntfy-approver-token"
 PROVISIONER_PW = "/etc/airlock/secrets/provisioner_password"
 ROOT_CA = "/etc/airlock/certs/root_ca.crt"
 STEPPATH = "/etc/airlock"
-PROVISIONER = "airlock-ssh"                 # PLACEHOLDER: must match provisioner name in ca.json
+PROVISIONER = "airlock-ssh"
 CA_URL = "https://localhost:9000"
-PRINCIPAL = "airlock-admin"                 # PLACEHOLDER: SSH principal/username on target hosts
+PRINCIPAL = "airlock-admin"                 # SSH principal/username on target hosts (UID 10300)
 AUDIT_LOG = "/var/log/airlock/audit.log"
 
 TOKEN_TTL = 300                             # pending approval lifetime (s); matches airlock-request TIMEOUT
@@ -73,9 +93,14 @@ MAX_REASON_CHARS = 200                      # upper bound on sanitized reason st
 # this set are rejected before a notification is even sent.
 TARGET_ALLOWLIST = {"target-host-1", "target-host-2"}
 
-# Optional hypervisor self-reference guard (see contrib/proxmox-hypervisor-guard/).
-# By default CURRENT_HOST_FILE does not exist on disk and these checks are a pure no-op.
+# Optional hypervisor self-reference guard & S0-tag hypervisor taint guard
+# (see contrib/proxmox-hypervisor-guard/).
+# By default CURRENT_HOST_FILE and S0_PROTECTED_HOSTS_FILE do not exist on disk
+# and these checks are a pure no-op unless configured.
 CURRENT_HOST_FILE = "/run/airlock/current-hypervisor"
+S0_PROTECTED_HOSTS_FILE = "/run/airlock/s0-protected-hosts"
+S0_PROTECTED_TARGETS = set()                # static S0-tainted hypervisors (e.g. {"optimuxprime"})
+S0_APPROVERS = {"brian", "brian-adm"}       # human S0 stewards (UID 10001) permitted on S0-protected hosts
 EVACUATE_CMD = "/usr/local/libexec/airlock-evacuate"
 EVACUATE_TIMEOUT = 120
 
@@ -87,7 +112,7 @@ BOOTSTRAP_USER = "root"
 ANSIBLE_PLAYBOOK_CMD = "/usr/bin/ansible-playbook"
 ONBOARD_PLAYBOOK = "/etc/airlock/ansible/onboard-target.yml"
 BREAK_GLASS_ESCROW_DIR = "/etc/airlock/secrets/break-glass"
-BREAK_GLASS_ESCROW_CMD = ""                 # optional Vaultwarden/Bitwarden/1Password CLI hook
+BREAK_GLASS_ESCROW_CMD = ""                 # optional 1Password/Bitwarden CLI hook
 ENROLL_TIMEOUT = 120
 # Server-side optional enrollment overrides (never sourced from untrusted agent request payloads):
 ENROLL_PRINCIPAL_UID = None
@@ -97,6 +122,7 @@ ENROLL_ALLOWED_APPROVERS = []
 
 TARGET_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 APPROVER_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+SECRET_PATH_RE = re.compile(r"^[a-z0-9][a-z0-9/_-]{0,126}[a-z0-9]$")
 DURATION_RE = re.compile(r"^(\d+)([mh])$")
 REQ_ID_RE = re.compile(r"^[0-9a-f]{16,64}$")
 CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]+")
@@ -143,6 +169,23 @@ def validate_approver(raw_approver):
     return cleaned, True
 
 
+def validate_secret_path(raw_path):
+    """Validate an OpenBao kv-v2 secret sub-path (e.g. 'zfs/metroplex').
+    Strictly blocks path traversal ('..'), double slashes, and 'break-glass/*'
+    so break-glass SSH keys can never be requested over ntfy."""
+    if not isinstance(raw_path, str):
+        return None
+    s = raw_path.strip()
+    if not SECRET_PATH_RE.match(s):
+        return None
+    if ".." in s or "//" in s:
+        return None
+    first_seg = s.split("/", 1)[0]
+    if first_seg in ("break-glass", "break_glass"):
+        return None
+    return s
+
+
 def check_opa_precheck(rec):
     """When PRECHECK_MODE == 'silent_precheck' and OPA_PRECHECK_URL is set, query OPA
     before paging the approver. Returns True if allowed, False if denied.
@@ -157,6 +200,7 @@ def check_opa_precheck(rec):
             "target": rec.get("target"),
             "approver": rec.get("approver", DEFAULT_APPROVER),
             "duration": rec.get("duration"),
+            "secret_path": rec.get("secret_path", ""),
             "reason": rec.get("reason", ""),
         }
     }).encode()
@@ -185,6 +229,31 @@ def current_hypervisor():
         return host or None
     except OSError:
         return None
+
+
+def is_s0_protected_target(target):
+    """Return True if `target` is an S0-protected hypervisor/node (either in
+    S0_PROTECTED_TARGETS or dynamically listed in S0_PROTECTED_HOSTS_FILE
+    because it currently hosts an `s0`-tagged or `10xxx` VM/CT)."""
+    if not target:
+        return False
+    if target in S0_PROTECTED_TARGETS:
+        return True
+    if S0_PROTECTED_HOSTS_FILE and os.path.isfile(S0_PROTECTED_HOSTS_FILE):
+        try:
+            with open(S0_PROTECTED_HOSTS_FILE) as fh:
+                for line in fh:
+                    item = line.split("#", 1)[0].strip()
+                    if item == target:
+                        return True
+        except OSError:
+            pass
+    return False
+
+
+def is_s0_approver(approver):
+    """Return True if `approver` is an authorized human S0 steward."""
+    return bool(approver and approver in S0_APPROVERS)
 
 
 def can_evacuate():
@@ -251,20 +320,113 @@ def validate_target_ip(raw_ip):
     return str(ip_obj)
 
 
+# ---- OpenBao HTTP client helpers --------------------------------------------
+def _openbao_token():
+    if OPENBAO_TOKEN_FILE and os.path.isfile(OPENBAO_TOKEN_FILE):
+        with open(OPENBAO_TOKEN_FILE) as fh:
+            tok = fh.read().strip()
+        if tok:
+            return tok
+    env_tok = os.environ.get("OPENBAO_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+    raise RuntimeError(f"missing OpenBao token at {OPENBAO_TOKEN_FILE}")
+
+
+def openbao_request(method, path, payload=None, wrap_ttl=None, timeout=15):
+    """Execute an authenticated HTTP API call against local OpenBao (UID 10302)."""
+    token = _openbao_token()
+    url = f"{OPENBAO_ADDR.rstrip('/')}/v1/{path.lstrip('/')}"
+    headers = {
+        "X-Vault-Token": token,
+        "Accept": "application/json",
+    }
+    if wrap_ttl:
+        headers["X-Vault-Wrap-TTL"] = str(wrap_ttl)
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urlrequest.Request(url, data=data, headers=headers, method=method)
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+
+def fetch_openbao_ca_pubkey():
+    """Retrieve the OpenSSH User CA public key from OpenBao's ssh-client-signer mount."""
+    resp = openbao_request("GET", f"{OPENBAO_SSH_MOUNT}/config/ca")
+    pub = (resp.get("data") or {}).get("public_key", "").strip()
+    if not pub:
+        raise RuntimeError(f"OpenBao {OPENBAO_SSH_MOUNT}/config/ca returned empty public_key")
+    return pub
+
+
+def escrow_break_glass_openbao(target, target_ip, bg_priv, bg_pub, fingerprint):
+    """Store target break-glass Ed25519 keypair in OpenBao kv-v2."""
+    openbao_request(
+        "POST",
+        f"{OPENBAO_KV_MOUNT}/data/break-glass/{target}",
+        payload={
+            "data": {
+                "target": target,
+                "target_ip": target_ip,
+                "private_key": bg_priv,
+                "public_key": bg_pub,
+                "fingerprint": fingerprint,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+
+
+def delete_break_glass_openbao(target):
+    """Best-effort rollback of a staged break-glass key in OpenBao kv-v2 if onboarding fails."""
+    try:
+        openbao_request("DELETE", f"{OPENBAO_KV_MOUNT}/metadata/break-glass/{target}")
+    except Exception as e:
+        log(f"warning: failed to roll back OpenBao break-glass key for {target}: {e}")
+
+
+def wrap_secret_openbao(secret_path, wrap_ttl=None):
+    """Read a secret from OpenBao kv-v2 with Cubbyhole Response-Wrapping (`X-Vault-Wrap-TTL`)
+    and return `(wrap_token, ttl_seconds)`. The plaintext secret never enters Python memory
+    or crosses ntfy."""
+    clean_path = validate_secret_path(secret_path)
+    if not clean_path:
+        raise ValueError(f"invalid or forbidden secret_path: {secret_path!r}")
+    ttl_hdr = wrap_ttl or OPENBAO_WRAP_TTL
+    resp = openbao_request("GET", f"{OPENBAO_KV_MOUNT}/data/{clean_path}", wrap_ttl=ttl_hdr)
+    wrap_info = resp.get("wrap_info") or {}
+    wrap_token = wrap_info.get("token", "").strip()
+    if not wrap_token:
+        raise RuntimeError(f"OpenBao did not return a response-wrapped token for {clean_path!r}")
+    return wrap_token, wrap_info.get("ttl", 60)
+
+
 def enroll_target(rec):
     """Day-0 target enrollment:
-    1. Verify target is not already enrolled / escrowed (never overwrite an existing break-glass key!).
-    2. Generate fresh ed25519 break-glass keypair in a 0700 tempdir.
-    3. Escrow private break-glass key (fail-closed if escrow fails, roll back staged files if playbook fails).
-    4. Run ansible-playbook onboard-target.yml using BIRTH_KEY_FILE, installing CA trust,
-       per-target principal, and replacing authorized_keys with ONLY break-glass.pub.
-    5. Add target to TARGET_ALLOWLIST and return (bg_fingerprint, bg_pub).
+    1. Generate a fresh Ed25519 break-glass keypair for `target`.
+    2. Fail-closed escrow the private key to OpenBao kv-v2 (`secret/data/break-glass/<target>`),
+       BREAK_GLASS_ESCROW_CMD (e.g. 1Password), and/or BREAK_GLASS_ESCROW_DIR (`0600`).
+    3. Build a single-host temporary Ansible inventory and execute `onboard-target.yml`
+       using `BIRTH_KEY_FILE`, locking `airlock-admin` to CA + break-glass and purging
+       the birth key from the target.
+    4. Append `target` to `TARGET_ALLOWLIST` and `ALLOWLIST_FILE`.
     """
     target = rec["target"]
     target_ip = rec["target_ip"]
     if not TARGET_NAME_RE.match(target):
         raise RuntimeError(f"invalid target hostname {target!r}")
-    if not USER_CA_PUBKEY_FILE or not os.path.isfile(USER_CA_PUBKEY_FILE):
+    ca_pubkey = ""
+    if USER_CA_PUBKEY_FILE and os.path.isfile(USER_CA_PUBKEY_FILE):
+        with open(USER_CA_PUBKEY_FILE) as fh:
+            ca_pubkey = fh.read().strip()
+    elif CA_BACKEND == "openbao":
+        ca_pubkey = fetch_openbao_ca_pubkey()
+    if not ca_pubkey:
         raise RuntimeError(f"missing USER_CA_PUBKEY_FILE at {USER_CA_PUBKEY_FILE}")
     if not BIRTH_KEY_FILE or not os.path.isfile(BIRTH_KEY_FILE):
         raise RuntimeError(f"missing BIRTH_KEY_FILE at {BIRTH_KEY_FILE}")
@@ -275,8 +437,6 @@ def enroll_target(rec):
         if is_target_allowlisted(target) or has_escrowed_break_glass_key(target):
             raise RuntimeError(f"target {target!r} is already enrolled or already has an escrowed break-glass key")
 
-        with open(USER_CA_PUBKEY_FILE) as fh:
-            ca_pubkey = fh.read().strip()
         birth_pubkey = ""
         if os.path.isfile(BIRTH_KEY_FILE + ".pub"):
             try:
@@ -292,6 +452,7 @@ def enroll_target(rec):
         inv_file = os.path.join(tmpdir, "inventory.json")
         known_hosts_file = os.path.join(tmpdir, "known_hosts")
         staged_files = []
+        staged_openbao = False
         try:
             subprocess.run(
                 ["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
@@ -311,6 +472,17 @@ def enroll_target(rec):
 
             # Step 2: Fail-closed escrow of break-glass private key BEFORE touching target
             escrowed = False
+            if (
+                CA_BACKEND == "openbao"
+                and OPENBAO_ESCROW_ENABLED
+                and (
+                    (OPENBAO_TOKEN_FILE and os.path.isfile(OPENBAO_TOKEN_FILE))
+                    or os.environ.get("OPENBAO_TOKEN")
+                )
+            ):
+                escrow_break_glass_openbao(target, target_ip, bg_priv, bg_pub, fingerprint)
+                staged_openbao = True
+                escrowed = True
             if BREAK_GLASS_ESCROW_CMD:
                 subprocess.run(
                     [BREAK_GLASS_ESCROW_CMD, target, target_ip],
@@ -389,12 +561,14 @@ def enroll_target(rec):
                     env=env, check=True, capture_output=True, text=True, timeout=ENROLL_TIMEOUT,
                 )
             except Exception:
-                # Roll back newly staged local escrow files if playbook failed before locking target
+                # Roll back newly staged local & OpenBao escrow entries if playbook failed before locking target
                 for sf in staged_files:
                     try:
                         os.remove(sf)
                     except OSError:
                         pass
+                if staged_openbao:
+                    delete_break_glass_openbao(target)
                 raise
 
             persist_allowlisted_target(target)
@@ -475,8 +649,57 @@ def validate_pubkey(pk):
     return s.startswith(("ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-"))
 
 
-def sign_cert(pubkey_text, duration, target=None, approver=None, stamp_approver=False):
-    """Sign pubkey_text for `duration` scoped to `target`; return (cert_text, valid_str)."""
+def _extract_cert_validity(certfile):
+    valid = ""
+    try:
+        out = subprocess.run(
+            ["ssh-keygen", "-L", "-f", certfile],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        for ln in out.splitlines():
+            if "Valid:" in ln:
+                valid = ln.strip()
+    except subprocess.SubprocessError:
+        pass
+    return valid
+
+
+def sign_cert_openbao(pubkey_text, duration, target=None, approver=None, stamp_approver=False):
+    """Sign `pubkey_text` for `duration` using OpenBao's `ssh-client-signer` engine."""
+    principal = target_principal(target)
+    principals = [principal]
+    if (STAMP_APPROVER_PRINCIPAL or stamp_approver) and approver:
+        principals.append(approver_principal(approver, target))
+
+    resp = openbao_request(
+        "POST",
+        f"{OPENBAO_SSH_MOUNT}/sign/{OPENBAO_SSH_ROLE}",
+        payload={
+            "public_key": pubkey_text.strip(),
+            "valid_principals": ",".join(principals),
+            "ttl": duration,
+            "key_id": principal,
+            "cert_type": "user",
+        },
+    )
+    cert_text = ((resp.get("data") or {}).get("signed_key") or "").strip()
+    if not cert_text:
+        raise RuntimeError("OpenBao ssh-client-signer returned empty signed_key")
+
+    tmpdir = tempfile.mkdtemp(prefix="airlock-sign-", dir="/tmp")
+    os.chmod(tmpdir, 0o700)
+    certfile = os.path.join(tmpdir, "k-cert.pub")
+    try:
+        with open(certfile, "w") as fh:
+            fh.write(cert_text + "\n")
+        valid = _extract_cert_validity(certfile)
+        return cert_text, valid
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def sign_cert_step(pubkey_text, duration, target=None, approver=None, stamp_approver=False):
+    """Legacy step-ca backend: sign pubkey_text for `duration` scoped to `target`."""
     principal = target_principal(target)
     tmpdir = tempfile.mkdtemp(prefix="airlock-sign-", dir="/tmp")
     os.chmod(tmpdir, 0o700)
@@ -503,18 +726,21 @@ def sign_cert(pubkey_text, duration, target=None, approver=None, stamp_approver=
                        capture_output=True, text=True, timeout=30)
         with open(certfile) as fh:
             cert_text = fh.read().strip()
-        valid = ""
-        try:
-            out = subprocess.run(["ssh-keygen", "-L", "-f", certfile],
-                                 capture_output=True, text=True, check=True).stdout
-            for ln in out.splitlines():
-                if "Valid:" in ln:
-                    valid = ln.strip()
-        except subprocess.SubprocessError:
-            pass
+        valid = _extract_cert_validity(certfile)
         return cert_text, valid
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def sign_cert(pubkey_text, duration, target=None, approver=None, stamp_approver=False):
+    """Sign pubkey_text for `duration` scoped to `target`; return (cert_text, valid_str)."""
+    if CA_BACKEND == "openbao":
+        return sign_cert_openbao(
+            pubkey_text, duration, target=target, approver=approver, stamp_approver=stamp_approver
+        )
+    return sign_cert_step(
+        pubkey_text, duration, target=target, approver=approver, stamp_approver=stamp_approver
+    )
 
 
 def reap_expired():
@@ -580,11 +806,21 @@ class Handler(BaseHTTPRequestHandler):
         target = rec.get("target")
         approver = rec.get("approver", DEFAULT_APPROVER)
         notify_topic = approver_topic(approver)
+        action = rec.get("action", "sign")
 
-        if rec.get("action") == "enroll":
+        # Defense-in-depth S0 hypervisor taint check at approval time
+        if is_s0_protected_target(target) and not is_s0_approver(approver):
+            log(f"blocked non-S0 approver {approver!r} on S0-protected target {target!r}")
+            audit("SIGN_BLOCKED_S0_PROTECTED", rec, extra=f"approver={json.dumps(approver)}")
+            ntfy_publish(TOPIC_APPROVE,
+                         f"Blocked: {target} is S0-protected (hosts S0/10xxx services) and cannot be approved by {approver!r}.",
+                         title="Airlock S0 taint guard", tags=["octagonal_sign"])
+            return self._reply(403, "s0-protected target requires s0 steward approval")
+
+        if action == "enroll":
             try:
                 fingerprint, _ = enroll_target(rec)
-            except (subprocess.SubprocessError, RuntimeError, OSError) as e:
+            except (subprocess.SubprocessError, RuntimeError, OSError, URLError) as e:
                 err_detail = (getattr(e, "stderr", None) or str(e)).strip()
                 log(f"enroll failed for {target!r}: {err_detail}")
                 audit("ENROLL_FAIL", rec, extra=f"err={json.dumps(err_detail[:160])}")
@@ -607,6 +843,34 @@ class Handler(BaseHTTPRequestHandler):
                          title="Target enrolled in Airlock ✅", tags=["white_check_mark"])
             log(f"enrolled req_id={rec['req_id']} target={target} ip={rec.get('target_ip')} bg_fp={fingerprint}")
             return self._reply(200, "enrolled")
+
+        if action == "secret":
+            secret_path = rec.get("secret_path", "")
+            try:
+                wrap_token, wrap_ttl = wrap_secret_openbao(secret_path)
+            except (RuntimeError, ValueError, OSError, URLError) as e:
+                err_detail = str(e).strip()
+                log(f"secret wrap failed for {target!r} path={secret_path!r}: {err_detail}")
+                audit("SECRET_WRAP_FAIL", rec, extra=f"path={json.dumps(secret_path)} err={json.dumps(err_detail[:160])}")
+                ntfy_publish(notify_topic,
+                             f"Secret wrap FAILED for {target} ({secret_path}) — check airlock logs.",
+                             title="Airlock secret error", tags=["rotating_light"])
+                return self._reply(500, "secret wrap failed")
+
+            ntfy_publish(TOPIC_CERT, json.dumps({
+                "req_id": rec["req_id"],
+                "wrap_token": wrap_token,
+                "wrap_ttl": wrap_ttl,
+                "secret_path": secret_path,
+                "target": target,
+                "approver": approver,
+            }))
+            audit("SECRET_WRAP", rec, extra=f"path={json.dumps(secret_path)} ttl={wrap_ttl}s")
+            ntfy_publish(notify_topic,
+                         f"Wrapped secret {secret_path} for {target} (single-use token TTL {wrap_ttl}s).",
+                         title="Wrapped secret issued ✅", tags=["lock"])
+            log(f"wrapped secret req_id={rec['req_id']} target={target} path={secret_path} ttl={wrap_ttl}s")
+            return self._reply(200, "wrapped")
 
         with _evac_lock:
             cur_host = current_hypervisor()
@@ -649,7 +913,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 cert_text, valid = sign_cert(rec["pubkey"], rec["duration"], target)
-        except (subprocess.SubprocessError, OSError) as e:
+        except (subprocess.SubprocessError, RuntimeError, OSError, URLError) as e:
             err_detail = (getattr(e, "stderr", None) or str(e)).strip()
             log(f"sign failed: {err_detail}")
             audit("SIGN_FAIL", rec, extra=f"err={json.dumps(err_detail[:160])}")
@@ -733,6 +997,13 @@ def handle_request(payload):
             "approver": approver,
             "approver_explicit": approver_explicit,
         }
+        if is_s0_protected_target(target) and not is_s0_approver(approver):
+            log(f"rejecting S0-protected enroll request for {target!r} via non-S0 approver {approver!r}")
+            audit("REJECT_S0_PROTECTED", enroll_rec)
+            ntfy_publish(TOPIC_APPROVE,
+                         f"Rejected enroll for S0-protected host {target} via non-S0 approver {approver!r}.",
+                         title="Airlock S0 taint guard", tags=["octagonal_sign"])
+            return
         if not check_opa_precheck(enroll_rec):
             log(f"OPA precheck denied enroll req_id={req_id} target={target} approver={approver}")
             audit("PRECHECK_DENIED", enroll_rec)
@@ -766,6 +1037,66 @@ def handle_request(payload):
         log(f"enroll request req_id={req_id} target={target} ip={target_ip} approver={approver} -> approval sent")
         return
 
+    if action == "secret":
+        if not isinstance(target, str) or not is_target_allowlisted(target):
+            log(f"rejecting secret request for non-allowlisted target {target!r}")
+            ntfy_publish(notify_topic,
+                         f"Rejected secret request: unknown target {target!r}.",
+                         title="Airlock request rejected", tags=["no_entry"])
+            return
+        secret_path = validate_secret_path(rec.get("secret_path"))
+        if not secret_path:
+            log(f"rejecting secret request for {target!r} with invalid/forbidden secret_path {rec.get('secret_path')!r}")
+            ntfy_publish(notify_topic,
+                         f"Rejected secret request for {target}: invalid/forbidden path {rec.get('secret_path')!r}.",
+                         title="Airlock request rejected", tags=["no_entry"])
+            return
+        reason = sanitize_reason(raw_reason)
+        secret_rec = {
+            "action": "secret",
+            "req_id": req_id,
+            "target": target,
+            "secret_path": secret_path,
+            "duration": OPENBAO_WRAP_TTL,
+            "reason": reason,
+            "approver": approver,
+            "approver_explicit": approver_explicit,
+        }
+        if is_s0_protected_target(target) and not is_s0_approver(approver):
+            log(f"rejecting secret request for S0-protected target {target!r} via non-S0 approver {approver!r}")
+            audit("REJECT_S0_PROTECTED", secret_rec)
+            ntfy_publish(TOPIC_APPROVE,
+                         f"Rejected secret request for S0-protected host {target} via non-S0 approver {approver!r}.",
+                         title="Airlock S0 taint guard", tags=["octagonal_sign"])
+            return
+        if not check_opa_precheck(secret_rec):
+            log(f"OPA precheck denied secret req_id={req_id} target={target} path={secret_path} approver={approver}")
+            audit("PRECHECK_DENIED", secret_rec)
+            ntfy_publish(TOPIC_APPROVE,
+                         f"OPA precheck blocked secret request for {target} ({secret_path}) via approver {approver!r}.",
+                         title="Airlock precheck blocked", tags=["shield"])
+            return
+        reap_expired()
+        token = secrets.token_urlsafe(32)
+        with _lock:
+            _pending[token] = {"record": secret_rec, "expiry": time.time() + TOKEN_TTL}
+        actions = [
+            {"action": "http", "label": "Approve: Wrap Secret", "url": f"{WEBHOOK_URL}/approve",
+             "method": "POST", "body": token, "clear": True},
+            {"action": "http", "label": "Deny", "url": f"{WEBHOOK_URL}/deny",
+             "method": "POST", "body": token, "clear": True},
+        ]
+        ntfy_publish(
+            notify_topic,
+            f"Wrap secret '{secret_path}' for {target} ({OPENBAO_WRAP_TTL} single-use token): {reason}",
+            title="Release wrapped OpenBao secret?",
+            actions=actions,
+            priority=5,
+            tags=["lock"],
+        )
+        log(f"secret request req_id={req_id} target={target} path={secret_path} approver={approver} -> approval sent")
+        return
+
     pubkey = rec.get("pubkey", "")
     duration = validate_duration(rec.get("duration"))
 
@@ -795,6 +1126,15 @@ def handle_request(payload):
         "approver": approver,
         "approver_explicit": approver_explicit,
     }
+
+    if is_s0_protected_target(target) and not is_s0_approver(approver):
+        # Caller-Visible Silence on TOPIC_CERT; alert human S0 steward on TOPIC_APPROVE
+        log(f"rejecting request for S0-protected target {target!r} via non-S0 approver {approver!r}")
+        audit("REJECT_S0_PROTECTED", clean_rec)
+        ntfy_publish(TOPIC_APPROVE,
+                     f"Rejected request for S0-protected host {target} via non-S0 approver {approver!r}.",
+                     title="Airlock S0 taint guard", tags=["octagonal_sign"])
+        return
 
     if not check_opa_precheck(clean_rec):
         # Caller-Visible Silence: do NOT publish to TOPIC_CERT (zero permission oracle!)

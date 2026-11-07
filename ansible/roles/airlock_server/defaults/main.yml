@@ -1,11 +1,31 @@
 ---
-# Default variables for airlock_server role (VM 10001 / 10.6.10.1)
+# Default variables for airlock_server role (VM 10002 / 10.6.10.2)
+# Note: 10.6.10.1 (10001) is reserved for the human S0 steward account (brian-adm, UID 10001).
 
-airlock_host_ip: "{{ ansible_host | default('10.6.10.1') }}"
+airlock_host_ip: "{{ ansible_host | default('10.6.10.2') }}"
 airlock_webhook_port: 8081
 airlock_ntfy_port: 8080
 airlock_ntfy_base_url: "http://{{ airlock_host_ip }}:{{ airlock_ntfy_port }}"
 airlock_ntfy_approver_token: "tk_replace_with_ntfy_approver_token"
+
+# Core CA & KeyVault backend ("openbao" default on UID 10302, or "step-ca" legacy)
+airlock_ca_backend: "openbao"
+airlock_openbao_uid: 10302
+airlock_openbao_gid: 10302
+airlock_openbao_user: "openbao"
+airlock_openbao_group: "openbao"
+airlock_openbao_addr: "http://127.0.0.1:8200"
+airlock_openbao_listen_address: "127.0.0.1:8200"
+airlock_openbao_storage_dir: "/var/lib/openbao/data"
+airlock_openbao_config_dir: "/etc/openbao"
+airlock_openbao_ssh_mount: "ssh-client-signer"
+airlock_openbao_ssh_role: "airlock-signer"
+airlock_openbao_kv_mount: "secret"
+airlock_openbao_transit_mount: "transit"
+airlock_openbao_escrow_enabled: true
+airlock_openbao_wrap_ttl: "60s"
+
+# Legacy step-ca settings (used when airlock_ca_backend == 'step-ca')
 airlock_ca_url: "https://localhost:9000"
 airlock_ca_name: "Airlock SSH CA"
 airlock_ca_dns: "localhost"
@@ -26,7 +46,14 @@ airlock_default_approver: "brian"
 airlock_per_approver_topics: false
 airlock_stamp_approver_principal: false
 airlock_precheck_mode: "boundary_only"      # "boundary_only" | "silent_precheck"
-airlock_opa_precheck_url: ""                # e.g. "http://10.6.30.1:8601/v1/airlock/precheck"
+airlock_opa_precheck_url: ""                # e.g. "http://10.6.10.3:8181/v1/data/airlock/allow"
+
+# S0-protected hypervisors & authorized human S0 stewards (UID 10001)
+airlock_s0_protected_targets:
+  - "optimuxprime"
+airlock_s0_approvers:
+  - "brian"
+  - "brian-adm"
 
 # Initial static target allowlist (Day-0 enrollments also append to /etc/airlock/target-allowlist.txt)
 airlock_initial_targets:
@@ -41,12 +68,12 @@ airlock_op_vault: "Homelab Break-Glass"
 
 # Optional Proxmox hypervisor self-reference guard & auto-evacuation inside the Airlock VM
 airlock_hypervisor_guard_enabled: false
-airlock_pve_vmid: "10001"
+airlock_pve_vmid: "10002"
 airlock_pve_peer_map: "optimuxprime:metroplex,metroplex:optimuxprime"
 airlock_pve_api_urls: {}
 # e.g.:
-#   optimuxprime: "https://10.6.1.2:8006"
-#   metroplex: "https://10.6.1.1:8006"
+#   optimuxprime: "https://10.6.1.1:8006"
+#   metroplex: "https://10.6.1.2:8006"
 airlock_pve_api_token: ""
 airlock_pve_cacert: ""
 airlock_pve_tls_insecure: false

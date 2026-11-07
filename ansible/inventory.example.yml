@@ -4,16 +4,23 @@ all:
     airlock_servers:
       hosts:
         airlock:
-          ansible_host: 10.6.19.1
+          # VM 10002 on VLAN 10 (10.6.10.2). Note: 10.6.10.1 (10001) is reserved for brian-adm (UID 10001).
+          ansible_host: 10.6.10.2
+          airlock_ca_backend: "openbao"             # OpenBao (UID 10302) as core Vault + SSH CA engine
           airlock_ntfy_approver_token: "tk_replace_with_ntfy_approver_token"
           airlock_principal_user: "airlock-admin"
-          airlock_precheck_mode: "boundary_only"   # or "silent_precheck" with airlock_opa_precheck_url
+          airlock_precheck_mode: "boundary_only"    # or "silent_precheck" with airlock_opa_precheck_url
+          airlock_s0_protected_targets:
+            - "optimuxprime"
+          airlock_s0_approvers:
+            - "brian"
+            - "brian-adm"
           airlock_hypervisor_guard_enabled: false
     airlock_targets:
       vars:
         airlock_principal_user: "airlock-admin"
-        # Paste contents of /etc/airlock/certs/ssh_user_ca_key.pub from the Airlock server:
-        airlock_user_ca_pubkey: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABB... step-ca-user-ca"
+        # Paste contents of /etc/airlock/certs/ssh_user_ca_key.pub from the Airlock server (OpenBao ssh-client-signer):
+        airlock_user_ca_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... openbao-ssh-user-ca"
         airlock_include_generic_principal: true
         airlock_allowed_approvers: []
         airlock_manage_authorized_keys: false
@@ -25,6 +32,6 @@ all:
           # Optional list of approvers whose minted certs this host accepts (e.g. ["brian", "teletraan"]):
           # airlock_allowed_approvers:
           #   - "brian"
-          # Optional per-target human break-glass public key (private key escrowed in Bitwarden/1Password):
+          # Optional per-target human break-glass public key (private key escrowed in OpenBao kv-v2 + 1Password):
           # airlock_manage_authorized_keys: true
           # airlock_break_glass_pubkey: "ssh-ed25519 AAAA... target-host-1-break-glass"

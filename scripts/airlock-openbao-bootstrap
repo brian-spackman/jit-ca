@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# airlock-openbao-bootstrap — idempotent OpenBao engine & least-privilege policy provisioner for Airlock (VM 10002).
+#
+# Requires an unsealed OpenBao instance listening at $OPENBAO_ADDR (default http://127.0.0.1:8200)
+# and an initial admin/root token in $OPENBAO_ADMIN_TOKEN_FILE (/etc/openbao/root.token) or $BAO_TOKEN.
+#
+# Configures:
+#   1. `ssh` secrets engine at `ssh-client-signer/`, generates Ed25519 User CA key, exports
+#      public key to `/etc/airlock/certs/ssh_user_ca_key.pub`, and configures `airlock-signer` role.
+#   2. `kv-v2` secrets engine at `secret/` (for break-glass escrow & Cubbyhole response-wrapped ZFS/service keys).
+#   3. `transit` secrets engine at `transit/` with `airlock-audit-key` (ed25519).
+#   4. Least-privilege `airlock-approver` ACL policy + periodic service token at
+#      `/etc/airlock/secrets/openbao-approver-token` (0600, step:step).
+set -euo pipefail
+
+export BAO_ADDR="${OPENBAO_ADDR:-http://127.0.0.1:8200}"
+ADMIN_TOKEN_FILE="${OPENBAO_ADMIN_TOKEN_FILE:-/etc/openbao/root.token}"
+APPROVER_TOKEN_FILE="${OPENBAO_APPROVER_TOKEN_FILE:-/etc/airlock/secrets/openbao-approver-token}"
+CA_PUBKEY_OUT="${USER_CA_PUBKEY_FILE:-/etc/airlock/certs/ssh_user_ca_key.pub}"
+SSH_MOUNT="${OPENBAO_SSH_MOUNT:-ssh-client-signer}"
+SSH_ROLE="${OPENBAO_SSH_ROLE:-airlock-signer}"
+KV_MOUNT="${OPENBAO_KV_MOUNT:-secret}"
+TRANSIT_MOUNT="${OPENBAO_TRANSIT_MOUNT:-transit}"
+APPROVER_USER="${AIRLOCK_APPROVER_USER:-step}"
+
+if [[ -z "${BAO_TOKEN:-}" && -r "$ADMIN_TOKEN_FILE" ]]; then
+    export BAO_TOKEN="$(tr -d '[:space:]' < "$ADMIN_TOKEN_FILE")"
+fi
+if [[ -z "${BAO_TOKEN:-}" ]]; then
+    echo "airlock-openbao-bootstrap: missing BAO_TOKEN or readable $ADMIN_TOKEN_FILE" >&2
+    exit 1
+fi
+
+bao_api() {
+    local method="$1"
+    local path="$2"
+    local data="${3:-}"
+    local args=(--fail --silent --show-error -X "$method" "${BAO_ADDR}/v1/${path#/}")
+    if [[ -n "$data" ]]; then
+        args+=(-H "Content-Type: application/json" -d "$data")
+    fi
+    curl "${args[@]}" --config - <<CURLCFG
+header = "X-Vault-Token: ${BAO_TOKEN}"
+CURLCFG
+}
+
+# 1. Mount SSH secrets engine if not already mounted
+MOUNTS="$(bao_api GET sys/mounts)"
+if ! grep -q "\"${SSH_MOUNT}/\"" <<<"$MOUNTS"; then
+    bao_api POST "sys/mounts/${SSH_MOUNT}" '{"type":"ssh","description":"Airlock JIT SSH User Certificate Authority"}' >/dev/null
+fi
+
+# 2. Configure Ed25519 CA signing key if not already initialized
+if ! PUB_JSON="$(bao_api GET "${SSH_MOUNT}/config/ca" 2>/dev/null)" || ! grep -q '"public_key"' <<<"$PUB_JSON"; then
+    bao_api POST "${SSH_MOUNT}/config/ca" '{"generate_signing_key":true,"key_type":"ed25519"}' >/dev/null
+    PUB_JSON="$(bao_api GET "${SSH_MOUNT}/config/ca")"
+fi
+
+PUB_KEY="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["public_key"].strip())' <<<"$PUB_JSON")"
+install -d -m 0755 "$(dirname "$CA_PUBKEY_OUT")"
+printf '%s\n' "$PUB_KEY" > "${CA_PUBKEY_OUT}.tmp"
+chmod 0644 "${CA_PUBKEY_OUT}.tmp"
+mv -f "${CA_PUBKEY_OUT}.tmp" "$CA_PUBKEY_OUT"
+
+# 3. Configure airlock-signer role
+bao_api POST "${SSH_MOUNT}/roles/${SSH_ROLE}" '{
+  "key_type": "ca",
+  "allow_user_certificates": true,
+  "allowed_users": "*",
+  "allowed_users_template": false,
+  "allowed_extensions": "permit-pty,permit-port-forwarding,permit-agent-forwarding,permit-X11-forwarding",
+  "default_extensions": {"permit-pty": ""},
+  "ttl": "1h",
+  "max_ttl": "8h"
+}' >/dev/null
+
+# 4. Mount kv-v2 at secret/ and transit at transit/
+if ! grep -q "\"${KV_MOUNT}/\"" <<<"$MOUNTS"; then
+    bao_api POST "sys/mounts/${KV_MOUNT}" '{"type":"kv","options":{"version":"2"},"description":"Airlock Break-Glass & Gated Secret Store"}' >/dev/null
+fi
+if ! grep -q "\"${TRANSIT_MOUNT}/\"" <<<"$MOUNTS"; then
+    bao_api POST "sys/mounts/${TRANSIT_MOUNT}" '{"type":"transit","description":"Airlock Cryptographic Audit & Signing Engine"}' >/dev/null
+fi
+bao_api POST "${TRANSIT_MOUNT}/keys/airlock-audit-key" '{"type":"ed25519"}' >/dev/null || true
+
+# 5. Install least-privilege airlock-approver ACL policy
+POLICY_HCL=$(cat <<POL
+path "${SSH_MOUNT}/sign/${SSH_ROLE}" {
+  capabilities = ["create", "update"]
+}
+path "${SSH_MOUNT}/config/ca" {
+  capabilities = ["read"]
+}
+path "${KV_MOUNT}/data/break-glass/*" {
+  capabilities = ["create", "update"]
+}
+path "${KV_MOUNT}/metadata/break-glass/*" {
+  capabilities = ["delete"]
+}
+path "${KV_MOUNT}/data/zfs/*" {
+  capabilities = ["read"]
+  min_wrapping_ttl = "10s"
+  max_wrapping_ttl = "120s"
+}
+path "${KV_MOUNT}/data/gated/*" {
+  capabilities = ["read"]
+  min_wrapping_ttl = "10s"
+  max_wrapping_ttl = "120s"
+}
+path "${TRANSIT_MOUNT}/sign/airlock-audit-key" {
+  capabilities = ["create", "update"]
+}
+POL
+)
+POLICY_JSON="$(python3 -c 'import json,sys; print(json.dumps({"policy": sys.stdin.read()}))' <<<"$POLICY_HCL")"
+bao_api PUT "sys/policies/acl/airlock-approver" "$POLICY_JSON" >/dev/null
+
+# 6. Issue periodic service token for airlock-approver if not already present
+if [[ ! -s "$APPROVER_TOKEN_FILE" ]]; then
+    TOK_JSON="$(bao_api POST "auth/token/create" '{"policies":["airlock-approver"],"period":"768h","renewable":true,"display_name":"airlock-approver","no_parent":true}')"
+    APP_TOK="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["auth"]["client_token"].strip())' <<<"$TOK_JSON")"
+    umask 0077
+    printf '%s\n' "$APP_TOK" > "${APPROVER_TOKEN_FILE}.tmp"
+    chown "${APPROVER_USER}:${APPROVER_USER}" "${APPROVER_TOKEN_FILE}.tmp" 2>/dev/null || true
+    chmod 0600 "${APPROVER_TOKEN_FILE}.tmp"
+    mv -f "${APPROVER_TOKEN_FILE}.tmp" "$APPROVER_TOKEN_FILE"
+fi

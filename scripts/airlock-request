@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""airlock-request — agent-side CLI to request just-in-time SSH access via Airlock.
+"""airlock-request — agent-side CLI to request JIT SSH certificates or response-wrapped OpenBao secrets via Airlock.
 
 Runs on the agent host. Publishes a request to the ntfy `airlock-requests` topic
-and blocks until Airlock publishes the signed cert back on `airlock-certs` (or
-until timeout). The agent holds only publish creds to airlock-requests + read on
-airlock-certs; it cannot approve or sign.
+and blocks until Airlock publishes the signed SSH cert (or single-use OpenBao
+Cubbyhole response-wrapping token) back on `airlock-certs` (or until timeout).
+The agent holds only publish creds to airlock-requests + read on airlock-certs;
+it cannot approve, sign, or read OpenBao directly.
 
-  usage: airlock-request <target> <duration> <reason> [approver]
-  e.g.:  airlock-request target-host-1 1h "restart the log-rotation service"
-         airlock-request transcribe 30m "restart whisper worker" teletraan
+  usage:
+    airlock-request <target> <duration> <reason> [approver]
+    airlock-request --secret <target> <secret_path> <reason> [approver]
 
-On success the cert is written next to the agent key and its validity printed.
-See REPLICATION-GUIDE.md (Section 6) for wiring this into ~/.ssh/config.
+  e.g.:
+    airlock-request target-host-1 1h "restart the log-rotation service"
+    airlock-request transcribe 30m "restart whisper worker" teletraan
+    airlock-request --secret metroplex zfs/metroplex "unlock encrypted ZFS dataset" brian
+
+On SSH cert success, the cert is written next to the agent key and its validity printed.
+On `--secret` success, the single-use OpenBao `wrap_token` is printed to stdout
+(or unwrapped directly if `AIRLOCK_UNWRAP_ADDR` is set in the environment).
 """
 
 import json
@@ -33,6 +40,7 @@ KEY = Path.home() / ".ssh/airlock/agent_key"
 CERT = Path.home() / ".ssh/airlock/agent_key-cert.pub"
 TIMEOUT = 300  # seconds to wait for approval
 APPROVER_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+SECRET_PATH_RE = re.compile(r"^[a-z0-9][a-z0-9/_-]{0,126}[a-z0-9]$")
 
 
 def die(msg, code=1):
@@ -49,26 +57,65 @@ def ensure_key():
     return (KEY.with_suffix(".pub")).read_text().strip()
 
 
+def unwrap_openbao_token(unwrap_addr, wrap_token):
+    url = f"{unwrap_addr.rstrip('/')}/v1/sys/wrapping/unwrap"
+    req = urlrequest.Request(
+        url,
+        data=b"",
+        headers={"X-Vault-Token": wrap_token, "Accept": "application/json"},
+        method="POST",
+    )
+    with urlrequest.urlopen(req, timeout=15) as resp:
+        body = json.loads(resp.read().decode())
+    return (body.get("data") or {}).get("data") or body.get("data") or {}
+
+
 def main():
-    if len(sys.argv) not in (4, 5):
-        die("usage: airlock-request <target> <duration> <reason> [approver]")
-    target, duration, reason = sys.argv[1], sys.argv[2], sys.argv[3]
-    approver = sys.argv[4].strip() if len(sys.argv) == 5 else None
+    args = sys.argv[1:]
+    is_secret = False
+    if args and args[0] == "--secret":
+        is_secret = True
+        args = args[1:]
+
+    if len(args) not in (3, 4):
+        die(
+            "usage: airlock-request <target> <duration> <reason> [approver]\n"
+            "       airlock-request --secret <target> <secret_path> <reason> [approver]"
+        )
+
+    target, second_arg, reason = args[0], args[1], args[2]
+    approver = args[3].strip() if len(args) == 4 else None
     if approver is not None and not APPROVER_NAME_RE.match(approver):
         die(f"invalid approver name: {approver!r}")
     if not TOKEN_FILE.exists():
         die(f"missing agent ntfy token at {TOKEN_FILE}")
     token = TOKEN_FILE.read_text().strip()
-    pubkey = ensure_key()
     req_id = secrets.token_hex(8)
 
-    req_obj = {
-        "req_id": req_id,
-        "target": target,
-        "duration": duration,
-        "reason": reason,
-        "pubkey": pubkey,
-    }
+    if is_secret:
+        secret_path = second_arg.strip()
+        if not SECRET_PATH_RE.match(secret_path) or ".." in secret_path or "//" in secret_path:
+            die(f"invalid secret_path: {secret_path!r}")
+        if secret_path.split("/", 1)[0] in ("break-glass", "break_glass"):
+            die("break-glass keys cannot be requested via airlock-request --secret")
+        req_obj = {
+            "action": "secret",
+            "req_id": req_id,
+            "target": target,
+            "secret_path": secret_path,
+            "reason": reason,
+        }
+    else:
+        duration = second_arg
+        pubkey = ensure_key()
+        req_obj = {
+            "req_id": req_id,
+            "target": target,
+            "duration": duration,
+            "reason": reason,
+            "pubkey": pubkey,
+        }
+
     if approver:
         req_obj["approver"] = approver
     request_json = json.dumps(req_obj)
@@ -81,8 +128,14 @@ def main():
         urlrequest.urlopen(req, timeout=15).read()
     except (HTTPError, URLError) as e:
         die(f"failed to publish request: {e}")
-    print(f"requested {target} for {duration} — waiting for approval "
-          f"(tap Approve on your phone, {TIMEOUT//60} min timeout)...")
+
+    if is_secret:
+        print(f"requested wrapped secret {second_arg} for {target} — waiting for approval "
+              f"(tap Approve: Wrap Secret on your phone, {TIMEOUT//60} min timeout)...",
+              file=sys.stderr)
+    else:
+        print(f"requested {target} for {second_arg} — waiting for approval "
+              f"(tap Approve on your phone, {TIMEOUT//60} min timeout)...")
 
     deadline = time.time() + TIMEOUT
     poll_url = f"{NTFY}/{TOPIC_CERT}/json?poll=1&since=2m"
@@ -108,7 +161,25 @@ def main():
                 body = json.loads(ev.get("message", ""))
             except json.JSONDecodeError:
                 continue
-            if body.get("req_id") != req_id or not body.get("cert"):
+            if body.get("req_id") != req_id:
+                continue
+
+            if is_secret:
+                wrap_token = body.get("wrap_token")
+                if not wrap_token:
+                    continue
+                unwrap_addr = os.environ.get("AIRLOCK_UNWRAP_ADDR", "").strip()
+                if unwrap_addr:
+                    try:
+                        secret_data = unwrap_openbao_token(unwrap_addr, wrap_token)
+                    except (HTTPError, URLError, OSError, ValueError) as e:
+                        die(f"CRITICAL: wrap_token unwrap failed (possible interception or expired 60s TTL): {e}", 3)
+                    print(json.dumps(secret_data))
+                else:
+                    print(wrap_token)
+                return
+
+            if not body.get("cert"):
                 continue
             CERT.parent.mkdir(parents=True, exist_ok=True)
             tmp_cert = CERT.with_suffix(".pub.tmp")
